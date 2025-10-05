@@ -24,3 +24,11 @@ gas-report.txt
 # zkit
 generated-types/
 zkit/
+cache_foundry
+out
+
+# Circom build artifacts
+circom/build/
+
+# Go build artifacts
+zk/build/

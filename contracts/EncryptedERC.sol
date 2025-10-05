@@ -12,6 +12,7 @@ import {EncryptedMetadata} from "./metadata/EncryptedMetadata.sol";
 
 // libraries
 import {BabyJubJub} from "./libraries/BabyJubJub.sol";
+import {AddressEncryption} from "./libraries/AddressEncryption.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 // types
@@ -81,6 +82,28 @@ contract EncryptedERC is
 
     /// @notice Mapping to track used mint nullifiers to prevent double-minting
     mapping(uint256 mintNullifier => bool isUsed) public alreadyMinted;
+
+    ///////////////////////////////////////////////////
+    ///         Encrypted Index State Variables     ///
+    ///////////////////////////////////////////////////
+
+    /// @notice Encrypted Index library for address encryption
+    using AddressEncryption for address;
+
+    /// @notice Mapping from index to encrypted address (only auditor can decrypt)
+    mapping(uint256 index => AddressEncryption.EncryptedAddress encryptedAddr) private indexToEncryptedAddress;
+
+    /// @notice Mapping from address to their assigned index (for verification)
+    mapping(address user => uint256 index) private addressToIndex;
+
+    /// @notice Mapping to track if user has registered for encrypted index
+    mapping(address user => bool hasIndex) private hasEncryptedIndex;
+
+    /// @notice Counter for next available index
+    uint256 private nextIndex = 1; // Start from 1, reserve 0 as invalid
+
+    /// @notice Auditor's public key for address encryption
+    Point private auditorPublicKeyForAddressEncryption;
 
     ///////////////////////////////////////////////////
     ///                    Events                   ///
@@ -157,6 +180,44 @@ contract EncryptedERC is
         uint256 tokenId,
         uint256[7] auditorPCT,
         address indexed auditorAddress
+    );
+
+    /**
+     * @notice Emitted when a user registers for encrypted index
+     * @param index The assigned index for the user
+     * @param encryptedAddressHash Hash of the encrypted address (for verification)
+     * @dev Only the hash is emitted to preserve privacy. The actual encrypted address is stored on-chain.
+     */
+    event EncryptedIndexRegistered(
+        uint256 indexed index,
+        bytes32 encryptedAddressHash
+    );
+
+    /**
+     * @notice Emitted when a withdrawal via encrypted index occurs
+     * @param userIndex The user's encrypted index (not their address)
+     * @param amount Amount withdrawn
+     * @param tokenId ID of the token withdrawn
+     * @param auditorPCT Auditor PCT values for compliance
+     * @param auditorAddress Address of the auditor
+     * @dev User's actual address is hidden - only their index is revealed
+     */
+    event WithdrawViaIndex(
+        uint256 indexed userIndex,
+        uint256 amount,
+        uint256 tokenId,
+        uint256[7] auditorPCT,
+        address indexed auditorAddress
+    );
+
+    /**
+     * @notice Emitted when auditor public key for address encryption is set
+     * @param pubKeyX X coordinate of the auditor's public key
+     * @param pubKeyY Y coordinate of the auditor's public key
+     */
+    event AuditorPublicKeyForAddressEncryptionSet(
+        uint256 pubKeyX,
+        uint256 pubKeyY
     );
 
     ///////////////////////////////////////////////////
@@ -1150,5 +1211,208 @@ contract EncryptedERC is
         for (uint256 i = 0; i < 7; i++) {
             transferInputs.amountPCT[i] = input[16 + i];
         }
+    }
+
+    ///////////////////////////////////////////////////
+    ///           Encrypted Index Functions         ///
+    ///////////////////////////////////////////////////
+
+    /**
+     * @notice Register for encrypted index to enable privacy-preserving withdrawals
+     * @param randomness Random value for encryption (must be cryptographically secure and unique)
+     * @dev This function:
+     *      1. Verifies user is registered in the eERC system
+     *      2. Verifies user doesn't already have an index
+     *      3. Verifies auditor public key is set
+     *      4. Encrypts user's address with auditor's public key + randomness
+     *      5. Assigns next available index
+     *      6. Stores encrypted address and mappings
+     *      7. Emits EncryptedIndexRegistered event with only hash (not address)
+     *
+     * Requirements:
+     * - User must be registered in the eERC system first
+     * - User can only register once
+     * - Auditor public key must be set
+     * - Randomness should be generated securely client-side
+     *
+     * @return userIndex The assigned index for this user
+     */
+    function registerEncryptedIndex(
+        uint256 randomness
+    ) external onlyIfUserRegistered(msg.sender) returns (uint256) {
+        require(!hasEncryptedIndex[msg.sender], "Already has encrypted index");
+        require(
+            auditorPublicKeyForAddressEncryption.x != 0,
+            "Auditor key for address encryption not set"
+        );
+
+        // Encrypt the user's address using ElGamal on BabyJubJub curve
+        AddressEncryption.EncryptedAddress memory encrypted = AddressEncryption.encryptAddress(
+            msg.sender,
+            auditorPublicKeyForAddressEncryption,
+            randomness
+        );
+
+        // Assign next index
+        uint256 userIndex = nextIndex++;
+
+        // Store encrypted address by index
+        indexToEncryptedAddress[userIndex] = encrypted;
+
+        // Store reverse mappings (private, not exposed in events)
+        addressToIndex[msg.sender] = userIndex;
+
+        // Mark as registered
+        hasEncryptedIndex[msg.sender] = true;
+
+        // Emit event with only index and hash (no address for privacy)
+        emit EncryptedIndexRegistered(
+            userIndex,
+            AddressEncryption.hashEncrypted(encrypted)
+        );
+
+        return userIndex;
+    }
+
+    /**
+     * @notice Set the auditor's public key for address encryption
+     * @param pubKey Point on BabyJubJub curve representing auditor's public key
+     * @dev Only owner can set this. This key is used to encrypt user addresses.
+     *
+     * Requirements:
+     * - Caller must be owner
+     * - Public key coordinates must be non-zero
+     */
+    function setAuditorPublicKeyForAddressEncryption(
+        Point memory pubKey
+    ) external onlyOwner {
+        require(pubKey.x != 0 && pubKey.y != 0, "Invalid public key");
+        auditorPublicKeyForAddressEncryption = pubKey;
+        emit AuditorPublicKeyForAddressEncryptionSet(pubKey.x, pubKey.y);
+    }
+
+    /**
+     * @notice Withdraw tokens using encrypted index (privacy-preserving)
+     * @param userIndex The user's encrypted index (from registration)
+     * @param tokenId The token ID to withdraw
+     * @param proof Zero-knowledge proof of sufficient balance
+     * @param balancePCT Balance PCT for proof verification
+     * @dev This function:
+     *      1. Verifies user has encrypted index
+     *      2. Verifies caller owns the specified index
+     *      3. Executes normal withdrawal logic
+     *      4. Emits WithdrawViaIndex event (only index shown, not address)
+     *
+     * Requirements:
+     * - User must have registered encrypted index
+     * - Caller must own the specified index
+     * - Must pass same proof verification as normal withdraw
+     */
+    function withdrawViaIndex(
+        uint256 userIndex,
+        uint256 tokenId,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT
+    )
+        external
+        onlyIfAuditorSet
+        onlyForConverter
+        onlyIfUserRegistered(msg.sender)
+    {
+        require(hasEncryptedIndex[msg.sender], "No encrypted index registered");
+        require(
+            addressToIndex[msg.sender] == userIndex,
+            "Index mismatch: caller does not own this index"
+        );
+
+        // Execute the withdrawal using the internal function
+        address from = msg.sender;
+        uint256[16] memory publicInputs = proof.publicSignals;
+        uint256 amount = publicInputs[0];
+
+        // validate public keys
+        _validatePublicKey(from, [publicInputs[1], publicInputs[2]]);
+        _validateAuditorPublicKey([publicInputs[7], publicInputs[8]]);
+
+        // Verify the zero-knowledge proof
+        bool isVerified = withdrawVerifier.verifyProof(
+            proof.proofPoints.a,
+            proof.proofPoints.b,
+            proof.proofPoints.c,
+            proof.publicSignals
+        );
+        if (!isVerified) {
+            revert InvalidProof();
+        }
+
+        // Perform the withdrawal
+        _withdraw(from, amount, tokenId, publicInputs, balancePCT);
+
+        // Extract auditor PCT and emit privacy-preserving event
+        {
+            uint256[7] memory auditorPCT;
+            for (uint256 i = 0; i < 7; i++) {
+                auditorPCT[i] = publicInputs[9 + i];
+            }
+
+            // Emit WithdrawViaIndex event (shows index, not address)
+            emit WithdrawViaIndex(userIndex, amount, tokenId, auditorPCT, auditor);
+        }
+    }
+
+    ///////////////////////////////////////////////////
+    ///       Encrypted Index View Functions        ///
+    ///////////////////////////////////////////////////
+
+    /**
+     * @notice Get the caller's encrypted index
+     * @return The caller's assigned index
+     */
+    function getMyIndex() external view returns (uint256) {
+        require(hasEncryptedIndex[msg.sender], "No encrypted index");
+        return addressToIndex[msg.sender];
+    }
+
+    /**
+     * @notice Check if a user has registered for encrypted index
+     * @param user Address to check
+     * @return True if user has encrypted index, false otherwise
+     */
+    function hasIndex(address user) external view returns (bool) {
+        return hasEncryptedIndex[user];
+    }
+
+    /**
+     * @notice Get encrypted address for a given index (auditor use)
+     * @param index The index to query
+     * @return The encrypted address (two points on BabyJubJub curve)
+     * @dev This returns the ElGamal ciphertext. Only someone with the auditor's
+     *      private key can decrypt this to recover the original address.
+     */
+    function getEncryptedAddress(
+        uint256 index
+    ) external view returns (AddressEncryption.EncryptedAddress memory) {
+        require(index > 0 && index < nextIndex, "Invalid index");
+        return indexToEncryptedAddress[index];
+    }
+
+    /**
+     * @notice Get the auditor's public key for address encryption
+     * @return The auditor's public key (point on BabyJubJub curve)
+     */
+    function getAuditorPublicKeyForAddressEncryption()
+        external
+        view
+        returns (Point memory)
+    {
+        return auditorPublicKeyForAddressEncryption;
+    }
+
+    /**
+     * @notice Get total number of registered encrypted indices
+     * @return The count of registered indices
+     */
+    function getTotalIndices() external view returns (uint256) {
+        return nextIndex - 1; // Subtract 1 because we start from index 1
     }
 }
