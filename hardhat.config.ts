@@ -11,6 +11,8 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const RPC_URL = process.env.RPC_URL || "https://api.avax.network/ext/bc/C/rpc";
+const FUJI_RPC_URL = process.env.FUJI_RPC_URL || "https://api.avax-test.network/ext/bc/C/rpc";
+const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 const config: HardhatUserConfig = {
   solidity: {
@@ -20,6 +22,7 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 200,
       },
+      viaIR: true,
     },
   },
   networks: {
@@ -29,6 +32,16 @@ const config: HardhatUserConfig = {
         blockNumber: 59121339,
         enabled: !!process.env.FORKING,
       },
+    },
+    fuji: {
+      url: FUJI_RPC_URL,
+      accounts: [DEPLOYER_PRIVATE_KEY],
+      chainId: 43113,
+    },
+    avalanche: {
+      url: RPC_URL,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+      chainId: 43114,
     },
   },
   gasReporter: {

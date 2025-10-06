@@ -14,6 +14,8 @@ import {EncryptedMetadata} from "./metadata/EncryptedMetadata.sol";
 import {BabyJubJub} from "./libraries/BabyJubJub.sol";
 import {AddressEncryption} from "./libraries/AddressEncryption.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 // types
 import {CreateEncryptedERCParams, Point, EGCT, EncryptedBalance, AmountPCT, MintProof, TransferProof, WithdrawProof, BurnProof, TransferInputs} from "./types/Types.sol";
@@ -60,7 +62,8 @@ contract EncryptedERC is
     TokenTracker,
     EncryptedUserBalances,
     AuditorManager,
-    EncryptedMetadata
+    EncryptedMetadata,
+    EIP712
 {
     ///////////////////////////////////////////////////
     ///                   State Variables           ///
@@ -104,6 +107,18 @@ contract EncryptedERC is
 
     /// @notice Auditor's public key for address encryption
     Point private auditorPublicKeyForAddressEncryption;
+
+    ///////////////////////////////////////////////////
+    ///      Signature-Based Withdrawal State       ///
+    ///////////////////////////////////////////////////
+
+    /// @notice EIP-712 typehash for withdrawal authorization
+    bytes32 private constant WITHDRAW_TYPEHASH = keccak256(
+        "WithdrawAuthorization(uint256 index,address recipient,uint256 nonce,uint256 deadline)"
+    );
+
+    /// @notice Mapping to track used nonces for signature-based withdrawals
+    mapping(address user => mapping(uint256 nonce => bool used)) public usedNonces;
 
     ///////////////////////////////////////////////////
     ///                    Events                   ///
@@ -211,6 +226,24 @@ contract EncryptedERC is
     );
 
     /**
+     * @notice Emitted when a signature-based withdrawal via index occurs
+     * @param userIndex The encrypted index used for withdrawal
+     * @param recipient Address receiving the withdrawn tokens
+     * @param amount Amount withdrawn
+     * @param tokenId Token ID
+     * @param auditorPCT Auditor's encrypted amount ciphertext
+     * @param auditorAddress Address of the auditor
+     */
+    event WithdrawViaIndexWithSignature(
+        uint256 indexed userIndex,
+        address indexed recipient,
+        uint256 amount,
+        uint256 tokenId,
+        uint256[7] auditorPCT,
+        address indexed auditorAddress
+    );
+
+    /**
      * @notice Emitted when auditor public key for address encryption is set
      * @param pubKeyX X coordinate of the auditor's public key
      * @param pubKeyY Y coordinate of the auditor's public key
@@ -243,7 +276,10 @@ contract EncryptedERC is
      */
     constructor(
         CreateEncryptedERCParams memory params
-    ) TokenTracker(params.isConverter) {
+    )
+        TokenTracker(params.isConverter)
+        EIP712("EncryptedERC", "1")
+    {
         // Validate contract addresses
         if (
             params.registrar == address(0) ||
@@ -660,6 +696,71 @@ contract EncryptedERC is
 
         // Convert and transfer the tokens
         _convertTo(from, amount, tokenAddress);
+    }
+
+    /**
+     * @notice Internal function to withdraw tokens to a specific recipient (for stealth wallets)
+     * @param from Address whose balance is being withdrawn
+     * @param recipient Address to receive the withdrawn tokens
+     * @param amount Amount to withdraw
+     * @param tokenId Token ID
+     * @param publicInputs Public inputs from the ZK proof
+     * @param balancePCT User's new balance ciphertext
+     */
+    function _withdrawToRecipient(
+        address from,
+        address recipient,
+        uint256 amount,
+        uint256 tokenId,
+        uint256[16] memory publicInputs,
+        uint256[7] memory balancePCT
+    ) internal {
+        address tokenAddress = tokenAddresses[tokenId];
+        if (tokenAddress == address(0)) {
+            revert UnknownToken();
+        }
+
+        {
+            // Extract the provided balance from the proof
+            EGCT memory providedBalance = EGCT({
+                c1: Point({x: publicInputs[3], y: publicInputs[4]}),
+                c2: Point({x: publicInputs[5], y: publicInputs[6]})
+            });
+
+            // Encrypt the withdrawn amount with FROM's public key (not recipient!)
+            EGCT memory encryptedWithdrawnAmount = BabyJubJub.encrypt(
+                Point({x: publicInputs[1], y: publicInputs[2]}),
+                amount
+            );
+
+            _privateBurn(
+                from,
+                tokenId,
+                providedBalance,
+                encryptedWithdrawnAmount,
+                balancePCT
+            );
+        }
+
+        // Convert and transfer tokens to RECIPIENT (not from!)
+        _convertToRecipient(from, recipient, amount, tokenAddress);
+    }
+
+    /**
+     * @notice Internal function to convert encrypted tokens to regular tokens for a recipient
+     * @param from Address whose encrypted balance is being burned
+     * @param recipient Address to receive the converted tokens
+     * @param amount Amount to convert
+     * @param tokenAddress Address of the ERC20 token
+     */
+    function _convertToRecipient(
+        address from,
+        address recipient,
+        uint256 amount,
+        address tokenAddress
+    ) internal {
+        // Burn from 'from' address encrypted balance, send tokens to 'recipient'
+        SafeERC20.safeTransfer(IERC20(tokenAddress), recipient, amount);
     }
 
     /**
@@ -1357,6 +1458,129 @@ contract EncryptedERC is
 
             // Emit WithdrawViaIndex event (shows index, not address)
             emit WithdrawViaIndex(userIndex, amount, tokenId, auditorPCT, auditor);
+        }
+    }
+
+    /**
+     * @notice Withdraw via encrypted index using a signature (stealth wallet support)
+     * @param userIndex The encrypted index of the owner
+     * @param recipient Address to receive the withdrawn tokens
+     * @param tokenId The token ID to withdraw
+     * @param proof Zero-knowledge proof of sufficient balance
+     * @param balancePCT User's new balance ciphertext
+     * @param signature EIP-712 signature from the index owner
+     * @param nonce Unique nonce to prevent replay attacks
+     * @param deadline Signature expiration timestamp
+     * @dev This allows a stealth wallet to withdraw on behalf of the index owner
+     *      The signature proves authorization without exposing the main wallet
+     */
+    function withdrawViaIndexWithSignature(
+        uint256 userIndex,
+        address recipient,
+        uint256 tokenId,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes memory signature,
+        uint256 nonce,
+        uint256 deadline
+    ) external onlyIfAuditorSet onlyForConverter {
+        // Check deadline
+        require(block.timestamp <= deadline, "Signature expired");
+
+        // Get the index owner from storage
+        address indexOwner = address(0);
+        for (uint256 i = 1; i < nextIndex; i++) {
+            if (addressToIndex[msg.sender] == i && i == userIndex) {
+                // msg.sender owns this index, they can withdraw directly
+                indexOwner = msg.sender;
+                break;
+            }
+        }
+
+        // If msg.sender doesn't own the index, verify signature
+        if (indexOwner == address(0)) {
+            // Build the struct hash per EIP-712
+            bytes32 structHash = keccak256(
+                abi.encode(
+                    WITHDRAW_TYPEHASH,
+                    userIndex,
+                    recipient,
+                    nonce,
+                    deadline
+                )
+            );
+
+            // Get the digest
+            bytes32 digest = _hashTypedDataV4(structHash);
+
+            // Recover the signer from the signature
+            address signer = ECDSA.recover(digest, signature);
+
+            // Verify the signer owns this index
+            require(hasEncryptedIndex[signer], "Signer has no encrypted index");
+            require(
+                addressToIndex[signer] == userIndex,
+                "Signer does not own this index"
+            );
+
+            // Verify nonce hasn't been used
+            require(!usedNonces[signer][nonce], "Nonce already used");
+            usedNonces[signer][nonce] = true;
+
+            indexOwner = signer;
+        }
+
+        // Verify the index owner is registered
+        require(
+            registrar.isUserRegistered(indexOwner),
+            "Index owner not registered"
+        );
+
+        // Verify the proof and execute withdrawal
+        uint256[16] memory publicInputs = proof.publicSignals;
+        uint256 amount = publicInputs[0];
+
+        // Validate public keys against index owner (not msg.sender!)
+        _validatePublicKey(indexOwner, [publicInputs[1], publicInputs[2]]);
+        _validateAuditorPublicKey([publicInputs[7], publicInputs[8]]);
+
+        // Verify the zero-knowledge proof
+        bool isVerified = withdrawVerifier.verifyProof(
+            proof.proofPoints.a,
+            proof.proofPoints.b,
+            proof.proofPoints.c,
+            proof.publicSignals
+        );
+        if (!isVerified) {
+            revert InvalidProof();
+        }
+
+        // Withdraw from index owner's balance, send to recipient
+        _withdrawToRecipient(
+            indexOwner,
+            recipient,
+            amount,
+            tokenId,
+            publicInputs,
+            balancePCT
+        );
+
+        // Extract auditor PCT and emit event
+        {
+            uint256[7] memory auditorPCT;
+            for (uint256 i = 0; i < 7; i++) {
+                auditorPCT[i] = publicInputs[9 + i];
+            }
+
+            // Emit signature-based withdrawal event
+            emit WithdrawViaIndexWithSignature(
+                userIndex,
+                recipient,
+                amount,
+                tokenId,
+                auditorPCT,
+                auditor
+            );
         }
     }
 
