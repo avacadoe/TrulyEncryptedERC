@@ -1,6 +1,7 @@
 node_modules
 .env
 *.DS_Store
+
 # Hardhat files
 /cache
 /artifacts
@@ -32,3 +33,15 @@ circom/build/
 
 # Go build artifacts
 zk/build/
+
+# Foundry deployment artifacts
+broadcast/
+lcov.info
+
+# Deployment and testing artifacts
+scripts/generateAuditorKeys.ts
+test-sdk-integration.mjs
+
+# Temporary documentation (keep only essential docs)
+DEPLOYMENT_FUJI.md
+ZK_PROOF_TEST_REPORT.md

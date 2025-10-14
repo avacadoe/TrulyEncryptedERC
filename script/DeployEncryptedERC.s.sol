@@ -18,12 +18,12 @@ import {CreateEncryptedERCParams} from "../contracts/types/Types.sol";
  *   --verify
  */
 contract DeployEncryptedERC is Script {
-    // Fuji testnet addresses (update these)
-    address constant REGISTRAR = address(0); // TODO: Deploy Registrar first
-    address constant MINT_VERIFIER = address(0); // TODO: Update
-    address constant WITHDRAW_VERIFIER = address(0); // TODO: Update
-    address constant TRANSFER_VERIFIER = address(0); // TODO: Update
-    address constant BURN_VERIFIER = address(0); // TODO: Update
+    // Fuji testnet addresses - Use OLD registrar where user is already registered
+    address constant REGISTRAR = 0x37cA898f669bDE5257a191c716B50FA1480105F8;
+    address constant MINT_VERIFIER = 0x5a73D582d0B267935Bc4561da2FA2a1b1cb1BC14;
+    address constant WITHDRAW_VERIFIER = 0xa3Be1221F59d58b8F70FaFF4DF924c33fFFC3F4e;
+    address constant TRANSFER_VERIFIER = 0x2Ecd1e34A826AfC48b29C42F9FBE6C45CBAeF98d;
+    address constant BURN_VERIFIER = 0x2Ecd1e34A826AfC48b29C42F9FBE6C45CBAeF98d; // Using transfer verifier
 
     function run() external {
         // Get deployer private key from env
@@ -58,11 +58,6 @@ contract DeployEncryptedERC is Script {
         console.log("1. Set auditor public key:");
         console.log("   cast send", address(encryptedERC));
         console.log("   'setAuditorPublicKey(address)' <AUDITOR_ADDRESS>");
-        console.log("");
-        console.log("2. Set auditor public key for address encryption:");
-        console.log("   cast send", address(encryptedERC));
-        console.log("   'setAuditorPublicKeyForAddressEncryption((uint256,uint256))'");
-        console.log("   '(<PUBKEY_X>,<PUBKEY_Y>)'");
 
         vm.stopBroadcast();
     }
