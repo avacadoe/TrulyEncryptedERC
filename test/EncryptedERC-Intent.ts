@@ -2,7 +2,6 @@ import type { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/dist/src
 import { expect } from "chai";
 import { ethers, zkit } from "hardhat";
 import type {
-	CalldataWithdrawCircuitGroth16,
 	RegistrationCircuit,
 } from "../generated-types/zkit";
 import {
@@ -24,6 +23,7 @@ import {
 	deployLibrary,
 	deployVerifiers,
 	getDecryptedBalance,
+	withdrawIntent,
 } from "./helpers";
 import { User } from "./user";
 
@@ -45,6 +45,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			registrationVerifier,
 			mintVerifier,
 			withdrawVerifier,
+			withdrawIntentVerifier,
 			transferVerifier,
 			burnVerifier,
 		} = await deployVerifiers(owner);
@@ -79,6 +80,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 				decimals: DECIMALS,
 				mintVerifier: mintVerifier,
 				withdrawVerifier: withdrawVerifier,
+				withdrawIntentVerifier: withdrawIntentVerifier,
 				transferVerifier: transferVerifier,
 				burnVerifier: burnVerifier,
 			});
@@ -177,47 +179,24 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 
 			expect(userInitialBalance).to.equal(depositAmount);
 
-			// 3. Prepare withdrawal with intent using helper
+			// 3. Prepare withdrawal with intent using new circuit
 			const userEncryptedBalance = [...balance.eGCT.c1, ...balance.eGCT.c2];
 			const auditorPublicKey = users[2].publicKey;
 
-			// Generate withdraw proof using the helper
-			const newBalance = userInitialBalance - withdrawAmount;
+			// Generate withdraw intent proof with private amount
+			const destination = BigInt(users[0].signer.address);
+			const nonce = 1n;
 
-			const {
-				ciphertext: userCiphertext,
-				nonce: userNonce,
-				authKey: userAuthKey,
-			} = processPoseidonEncryption([newBalance], users[0].publicKey);
-
-			const {
-				ciphertext: auditorCiphertext,
-				nonce: auditorNonce,
-				encRandom: auditorEncRandom,
-				authKey: auditorAuthKey,
-			} = processPoseidonEncryption([withdrawAmount], auditorPublicKey);
-
-			const input = {
-				ValueToWithdraw: withdrawAmount,
-				SenderPrivateKey: users[0].formattedPrivateKey,
-				SenderPublicKey: users[0].publicKey,
-				SenderBalance: userInitialBalance,
-				SenderBalanceC1: userEncryptedBalance.slice(0, 2),
-				SenderBalanceC2: userEncryptedBalance.slice(2, 4),
-				AuditorPublicKey: auditorPublicKey,
-				AuditorPCT: auditorCiphertext,
-				AuditorPCTAuthKey: auditorAuthKey,
-				AuditorPCTNonce: auditorNonce,
-				AuditorPCTRandom: auditorEncRandom,
-			};
-
-			const circuit = await zkit.getCircuit("WithdrawCircuit");
-			const withdrawCircuit = circuit as unknown as CalldataWithdrawCircuitGroth16;
-
-			const proof = await withdrawCircuit.generateProof(input);
-			const calldata = await withdrawCircuit.generateCalldata(proof);
-
-			const userBalancePCT = [...userCiphertext, ...userAuthKey, userNonce];
+			const { proof: calldata, userBalancePCT, intentHash } = await withdrawIntent(
+				withdrawAmount,
+				destination,
+				tokenId,
+				nonce,
+				users[0],
+				userEncryptedBalance,
+				userInitialBalance,
+				auditorPublicKey,
+			);
 
 			// 4. Create encrypted intent metadata
 			const MESSAGE = "WITHDRAW_INTENT transaction metadata testing.";
@@ -226,7 +205,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			// 5. Execute withdrawWithIntent
 			const withdrawTx = await encryptedERC
 				.connect(users[0].signer)
-				.withdrawWithIntent(tokenId, calldata, userBalancePCT, encryptedMetadata);
+				.withdrawWithIntent(tokenId, withdrawAmount, calldata, userBalancePCT, encryptedMetadata);
 
 			const receipt = await withdrawTx.wait();
 
@@ -322,6 +301,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			await expect(
 				encryptedERC.connect(unregisteredSigner).withdrawWithIntent(
 					1n,
+					100n,
 					{
 						proofPoints: {
 							a: [0n, 0n],
@@ -362,6 +342,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			await expect(
 				encryptedERC.connect(users[0].getSigner()).withdrawWithIntent(
 					1n,
+					100n,
 					{
 						proofPoints: {
 							a: [0n, 0n],

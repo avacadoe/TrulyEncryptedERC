@@ -71,6 +71,7 @@ contract EncryptedERC is
     /// @notice Verifier contracts for each operation
     IMintVerifier public mintVerifier;
     IWithdrawVerifier public withdrawVerifier;
+    IWithdrawVerifier public withdrawIntentVerifier;
     ITransferVerifier public transferVerifier;
     IBurnVerifier public burnVerifier;
 
@@ -200,6 +201,7 @@ contract EncryptedERC is
             params.registrar == address(0) ||
             params.mintVerifier == address(0) ||
             params.withdrawVerifier == address(0) ||
+            params.withdrawIntentVerifier == address(0) ||
             params.transferVerifier == address(0) ||
             params.burnVerifier == address(0)
         ) {
@@ -210,6 +212,7 @@ contract EncryptedERC is
         registrar = IRegistrar(params.registrar);
         mintVerifier = IMintVerifier(params.mintVerifier);
         withdrawVerifier = IWithdrawVerifier(params.withdrawVerifier);
+        withdrawIntentVerifier = IWithdrawVerifier(params.withdrawIntentVerifier);
         transferVerifier = ITransferVerifier(params.transferVerifier);
         burnVerifier = IBurnVerifier(params.burnVerifier);
 
@@ -535,6 +538,7 @@ contract EncryptedERC is
      */
     function withdrawWithIntent(
         uint256 tokenId,
+        uint256 amount,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
         bytes calldata intentMetadata
@@ -544,7 +548,7 @@ contract EncryptedERC is
         onlyForConverter
         onlyIfUserRegistered(msg.sender)
     {
-        _executeWithdrawWithIntent(tokenId, proof, balancePCT, intentMetadata);
+        _executeWithdrawWithIntent(tokenId, amount, proof, balancePCT, intentMetadata);
     }
 
     function sendEncryptedMetadata(
@@ -1134,20 +1138,30 @@ contract EncryptedERC is
      */
     function _executeWithdrawWithIntent(
         uint256 tokenId,
+        uint256 amount,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
         bytes memory intentMetadata
     ) internal {
         address from = msg.sender;
         uint256[16] memory publicInputs = proof.publicSignals;
-        uint256 amount = publicInputs[0];
+
+        // In the new circuit:
+        // publicInputs[0-1] = SenderPublicKey
+        // publicInputs[2-3] = SenderBalanceC1
+        // publicInputs[4-5] = SenderBalanceC2
+        // publicInputs[6-7] = AuditorPublicKey
+        // publicInputs[8-11] = AuditorPCT
+        // publicInputs[12-13] = AuditorPCTAuthKey
+        // publicInputs[14] = AuditorPCTNonce
+        // publicInputs[15] = IntentHash
 
         // validate public keys
-        _validatePublicKey(from, [publicInputs[1], publicInputs[2]]);
-        _validateAuditorPublicKey([publicInputs[7], publicInputs[8]]);
+        _validatePublicKey(from, [publicInputs[0], publicInputs[1]]);
+        _validateAuditorPublicKey([publicInputs[6], publicInputs[7]]);
 
-        // Verify the zero-knowledge proof
-        bool isVerified = withdrawVerifier.verifyProof(
+        // Verify the zero-knowledge proof using intent verifier
+        bool isVerified = withdrawIntentVerifier.verifyProof(
             proof.proofPoints.a,
             proof.proofPoints.b,
             proof.proofPoints.c,
@@ -1157,8 +1171,29 @@ contract EncryptedERC is
             revert InvalidProof();
         }
 
+        // Remap public inputs to match the format expected by _withdraw
+        // _withdraw expects the old format:
+        // [0] = amount, [1-2] = SenderPublicKey, [3-4] = SenderBalanceC1, [5-6] = SenderBalanceC2, [7-8] = AuditorPublicKey
+        uint256[16] memory remappedInputs;
+        remappedInputs[0] = amount; // amount (not in proof, passed as parameter)
+        remappedInputs[1] = publicInputs[0]; // SenderPublicKey[0]
+        remappedInputs[2] = publicInputs[1]; // SenderPublicKey[1]
+        remappedInputs[3] = publicInputs[2]; // SenderBalanceC1[0]
+        remappedInputs[4] = publicInputs[3]; // SenderBalanceC1[1]
+        remappedInputs[5] = publicInputs[4]; // SenderBalanceC2[0]
+        remappedInputs[6] = publicInputs[5]; // SenderBalanceC2[1]
+        remappedInputs[7] = publicInputs[6]; // AuditorPublicKey[0]
+        remappedInputs[8] = publicInputs[7]; // AuditorPublicKey[1]
+        remappedInputs[9] = publicInputs[8]; // AuditorPCT[0]
+        remappedInputs[10] = publicInputs[9]; // AuditorPCT[1]
+        remappedInputs[11] = publicInputs[10]; // AuditorPCT[2]
+        remappedInputs[12] = publicInputs[11]; // AuditorPCT[3]
+        remappedInputs[13] = publicInputs[12]; // AuditorPCTAuthKey[0]
+        remappedInputs[14] = publicInputs[13]; // AuditorPCTAuthKey[1]
+        remappedInputs[15] = publicInputs[14]; // AuditorPCTNonce
+
         // Perform the withdrawal
-        _withdraw(from, amount, tokenId, publicInputs, balancePCT);
+        _withdraw(from, amount, tokenId, remappedInputs, balancePCT);
 
         // Emit private operation event (no amount details)
         emit PrivateOperation(from, "WITHDRAW_INTENT");

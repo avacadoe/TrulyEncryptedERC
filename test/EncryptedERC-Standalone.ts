@@ -74,6 +74,7 @@ describe("EncryptedERC - Standalone", () => {
 			symbol: "TEST",
 			mintVerifier,
 			withdrawVerifier,
+			withdrawIntentVerifier: withdrawVerifier, // Use same verifier for now
 			transferVerifier,
 			burnVerifier,
 			decimals: DECIMALS,

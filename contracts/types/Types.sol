@@ -22,6 +22,7 @@ struct CreateEncryptedERCParams {
     // verifiers
     address mintVerifier;
     address withdrawVerifier;
+    address withdrawIntentVerifier;
     address transferVerifier;
     address burnVerifier;
 }

@@ -9,9 +9,11 @@ import type {
 	CalldataMintCircuitGroth16,
 	CalldataTransferCircuitGroth16,
 	CalldataWithdrawCircuitGroth16,
+	CalldataWithdrawIntentCircuitGroth16,
 	MintCircuit,
 	TransferCircuit,
 	WithdrawCircuit,
+	WithdrawIntentCircuit,
 } from "../generated-types/zkit";
 import { processPoseidonDecryption, processPoseidonEncryption } from "../src";
 import { decryptPoint, encryptMessage } from "../src/jub/jub";
@@ -30,6 +32,7 @@ import {
 	RegistrationCircuitGroth16Verifier__factory,
 	TransferCircuitGroth16Verifier__factory,
 	WithdrawCircuitGroth16Verifier__factory,
+	WithdrawIntentCircuitGroth16Verifier__factory,
 } from "../typechain-types/factories/contracts/verifiers";
 import type { User } from "./user";
 
@@ -40,6 +43,7 @@ import type { User } from "./user";
  * @returns registrationVerifier - Registration verifier contract address
  * @returns mintVerifier - Mint verifier contract address
  * @returns withdrawVerifier - Withdraw verifier contract address
+ * @returns withdrawIntentVerifier - Withdraw intent verifier contract address
  * @returns transferVerifier - Transfer verifier contract address
  * @returns burnVerifier - Burn verifier contract address
  */
@@ -62,6 +66,10 @@ export const deployVerifiers = async (
 		const withdrawVerifier = await withdrawVerifierFactory.deploy();
 		await withdrawVerifier.waitForDeployment();
 
+		const withdrawIntentVerifierFactory = new WithdrawVerifier__factory(signer);
+		const withdrawIntentVerifier = await withdrawIntentVerifierFactory.deploy();
+		await withdrawIntentVerifier.waitForDeployment();
+
 		const transferVerifierFactory = new TransferVerifier__factory(signer);
 		const transferVerifier = await transferVerifierFactory.deploy();
 		await transferVerifier.waitForDeployment();
@@ -74,6 +82,7 @@ export const deployVerifiers = async (
 			registrationVerifier: registrationVerifier.target.toString(),
 			mintVerifier: mintVerifier.target.toString(),
 			withdrawVerifier: withdrawVerifier.target.toString(),
+			withdrawIntentVerifier: withdrawIntentVerifier.target.toString(),
 			transferVerifier: transferVerifier.target.toString(),
 			burnVerifier: burnVerifier.target.toString(),
 		};
@@ -95,6 +104,12 @@ export const deployVerifiers = async (
 	const withdrawVerifier = await withdrawVerifierFactory.deploy();
 	await withdrawVerifier.waitForDeployment();
 
+	const withdrawIntentVerifierFactory = new WithdrawIntentCircuitGroth16Verifier__factory(
+		signer,
+	);
+	const withdrawIntentVerifier = await withdrawIntentVerifierFactory.deploy();
+	await withdrawIntentVerifier.waitForDeployment();
+
 	const transferVerifierFactory = new TransferCircuitGroth16Verifier__factory(
 		signer,
 	);
@@ -110,6 +125,7 @@ export const deployVerifiers = async (
 		registrationVerifier: registrationVerifier.target.toString(),
 		mintVerifier: mintVerifier.target.toString(),
 		withdrawVerifier: withdrawVerifier.target.toString(),
+		withdrawIntentVerifier: withdrawIntentVerifier.target.toString(),
 		transferVerifier: transferVerifier.target.toString(),
 		burnVerifier: burnVerifier.target.toString(),
 	};
@@ -497,4 +513,84 @@ export const getDecryptedBalance = async (
 	}
 
 	return totalBalance;
+};
+
+/**
+ * Function for withdrawing tokens privately using intent-based withdrawal with private amount
+ * @param amount Amount to be withdrawn
+ * @param destination Destination address
+ * @param tokenId Token ID
+ * @param nonce Intent nonce
+ * @param user User object
+ * @param userEncryptedBalance User encrypted balance from eERC contract
+ * @param userBalance User plain balance
+ * @param auditorPublicKey Auditor's public key
+ * @returns proof - Proof and public inputs for the generated proof
+ * @returns userBalancePCT - User's balance after the withdrawal encrypted with Poseidon encryption
+ * @returns intentHash - Hash of the intent (amount, destination, tokenId, nonce)
+ */
+export const withdrawIntent = async (
+	amount: bigint,
+	destination: bigint,
+	tokenId: bigint,
+	nonce: bigint,
+	user: User,
+	userEncryptedBalance: bigint[],
+	userBalance: bigint,
+	auditorPublicKey: bigint[],
+): Promise<{
+	proof: CalldataWithdrawIntentCircuitGroth16;
+	userBalancePCT: bigint[];
+	intentHash: bigint;
+}> => {
+	const newBalance = userBalance - amount;
+	const userPublicKey = user.publicKey;
+
+	// 1. Compute intent hash: hash(amount, destination, tokenId, nonce)
+	const intentHash = poseidon([amount, destination, tokenId, nonce]);
+
+	// 2. create pct for the user with the newly calculated balance
+	const {
+		ciphertext: userCiphertext,
+		nonce: userNonce,
+		authKey: userAuthKey,
+	} = processPoseidonEncryption([newBalance], userPublicKey);
+
+	// 3. create pct for the auditor with the withdrawal amount
+	const {
+		ciphertext: auditorCiphertext,
+		nonce: auditorNonce,
+		encRandom: auditorEncRandom,
+		authKey: auditorAuthKey,
+	} = processPoseidonEncryption([amount], auditorPublicKey);
+
+	const input = {
+		ValueToWithdraw: amount,
+		Destination: destination,
+		TokenId: tokenId,
+		Nonce: nonce,
+		SenderPrivateKey: user.formattedPrivateKey,
+		SenderPublicKey: userPublicKey,
+		SenderBalance: userBalance,
+		SenderBalanceC1: userEncryptedBalance.slice(0, 2),
+		SenderBalanceC2: userEncryptedBalance.slice(2, 4),
+		AuditorPublicKey: auditorPublicKey,
+		AuditorPCT: auditorCiphertext,
+		AuditorPCTAuthKey: auditorAuthKey,
+		AuditorPCTNonce: auditorNonce,
+		AuditorPCTRandom: auditorEncRandom,
+		IntentHash: intentHash,
+	};
+
+	const circuit = await zkit.getCircuit("WithdrawIntentCircuit");
+	const withdrawIntentCircuit = circuit as unknown as WithdrawIntentCircuit;
+
+	const proof = await withdrawIntentCircuit.generateProof(input);
+	const calldata = await withdrawIntentCircuit.generateCalldata(proof);
+
+	return {
+		proof: calldata,
+		userBalancePCT: [...userCiphertext, ...userAuthKey, userNonce],
+		intentHash,
+	};
 };
