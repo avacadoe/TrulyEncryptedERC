@@ -44,6 +44,34 @@ export class User {
 
 		return registrationHash;
 	}
+
+	/**
+	 * Get the user's Ethereum address
+	 */
+	getAddress() {
+		return this.signer.address;
+	}
+
+	/**
+	 * Get the user's signer
+	 */
+	getSigner() {
+		return this.signer;
+	}
+
+	/**
+	 * Get the user's public key
+	 */
+	getPublicKey(): [bigint, bigint] {
+		return [this.publicKey[0], this.publicKey[1]];
+	}
+
+	/**
+	 * Get the user's private key
+	 */
+	getPrivateKey() {
+		return this.formattedPrivateKey;
+	}
 }
 
 export class BurnUser {

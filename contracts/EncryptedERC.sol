@@ -159,6 +159,18 @@ contract EncryptedERC is
         address indexed auditorAddress
     );
 
+    /**
+     * @notice Emitted when a private operation with intent occurs
+     * @param user Address of the user performing the operation
+     * @param operationType Type of operation being performed (e.g., "WITHDRAW_INTENT")
+     * @dev This event is emitted for intent-based operations where specific details
+     *      are encrypted in metadata rather than exposed in events
+     */
+    event PrivateOperation(
+        address indexed user,
+        string operationType
+    );
+
     ///////////////////////////////////////////////////
     ///                   Modifiers                 ///
     ///////////////////////////////////////////////////
@@ -508,6 +520,31 @@ contract EncryptedERC is
         onlyIfUserRegistered(msg.sender)
     {
         _executeWithdraw(tokenId, proof, balancePCT, message);
+    }
+
+    /**
+     * @notice Withdraws encrypted tokens using intent-based metadata for privacy
+     * @param tokenId ID of the token to withdraw
+     * @param proof The withdraw proof proving the validity of the withdrawal
+     * @param balancePCT The balance PCT for the user after the withdrawal
+     * @param intentMetadata Encrypted metadata containing withdrawal intent details (amount, destination, memo)
+     * @dev This function provides enhanced privacy by not emitting a public Withdraw event.
+     *      Instead, it emits only a PrivateOperation event and PrivateMessage with encrypted metadata.
+     *      The withdrawal amount is still validated by the ZK proof but not exposed in events.
+     *      Only the user can decrypt the intent metadata to see withdrawal details.
+     */
+    function withdrawWithIntent(
+        uint256 tokenId,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes calldata intentMetadata
+    )
+        external
+        onlyIfAuditorSet
+        onlyForConverter
+        onlyIfUserRegistered(msg.sender)
+    {
+        _executeWithdrawWithIntent(tokenId, proof, balancePCT, intentMetadata);
     }
 
     function sendEncryptedMetadata(
@@ -1081,6 +1118,53 @@ contract EncryptedERC is
 
         // emit metadata if message is provided
         _emitMetadata(msg.sender, from, "WITHDRAW", message);
+    }
+
+    /**
+     * @notice Executes a withdrawal with intent-based privacy
+     * @param tokenId ID of the token to withdraw
+     * @param proof The withdraw proof proving the validity of the withdrawal
+     * @param balancePCT The balance PCT for the user after the withdrawal
+     * @param intentMetadata Encrypted metadata containing withdrawal intent
+     * @dev This function performs the same validation and withdrawal as _executeWithdraw
+     *      but does NOT emit the public Withdraw event. Instead it emits:
+     *      1. PrivateOperation event (minimal info: user address and operation type)
+     *      2. PrivateMessage event (encrypted metadata with full intent details)
+     *      This provides enhanced privacy as withdrawal amount and details are not publicly visible.
+     */
+    function _executeWithdrawWithIntent(
+        uint256 tokenId,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes memory intentMetadata
+    ) internal {
+        address from = msg.sender;
+        uint256[16] memory publicInputs = proof.publicSignals;
+        uint256 amount = publicInputs[0];
+
+        // validate public keys
+        _validatePublicKey(from, [publicInputs[1], publicInputs[2]]);
+        _validateAuditorPublicKey([publicInputs[7], publicInputs[8]]);
+
+        // Verify the zero-knowledge proof
+        bool isVerified = withdrawVerifier.verifyProof(
+            proof.proofPoints.a,
+            proof.proofPoints.b,
+            proof.proofPoints.c,
+            proof.publicSignals
+        );
+        if (!isVerified) {
+            revert InvalidProof();
+        }
+
+        // Perform the withdrawal
+        _withdraw(from, amount, tokenId, publicInputs, balancePCT);
+
+        // Emit private operation event (no amount details)
+        emit PrivateOperation(from, "WITHDRAW_INTENT");
+
+        // Emit encrypted metadata with full intent details
+        _emitMetadata(from, from, "WITHDRAW_INTENT", intentMetadata);
     }
 
     /**
