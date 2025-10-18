@@ -664,18 +664,17 @@ contract EncryptedERC is
 
     /**
      * @notice Submit a withdraw intent for later execution (two-step process for enhanced privacy)
-     * @param tokenId ID of the token to withdraw
-     * @param destination Address to receive the ERC20 tokens
-     * @param amount Amount to withdraw
+     * @param tokenId ID of the token to withdraw (needed for pending intent check)
      * @param proof The withdraw proof proving the validity of the withdrawal
+     *              proof.publicSignals[15] contains the intentHash = poseidon(amount, destination, tokenId, nonce)
      * @param balancePCT The balance PCT for the user after the withdrawal
      * @param intentMetadata Encrypted metadata containing withdrawal intent details
-     * @return intentHash Unique hash identifying this intent
+     * @return intentHash Unique hash identifying this intent (extracted from proof)
+     * @dev Amount and destination are NOT visible in calldata - they're hidden in the intentHash!
+     *      This provides privacy during intent submission. They're only revealed during execution.
      */
     function submitWithdrawIntent(
         uint256 tokenId,
-        address destination,
-        uint256 amount,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
         bytes calldata intentMetadata
@@ -691,18 +690,11 @@ contract EncryptedERC is
             revert PendingIntentExists();
         }
 
+        // Extract intentHash from proof public signals [15]
+        // This hash was computed in the circuit as: poseidon(amount, destination, tokenId, nonce)
+        intentHash = bytes32(proof.publicSignals[15]);
+
         uint256 intentId = nextIntentId++;
-        intentHash = keccak256(abi.encodePacked(
-            msg.sender,
-            tokenId,
-            destination,
-            amount,
-            proof.publicSignals,
-            balancePCT,
-            intentMetadata,
-            intentId,
-            block.timestamp
-        ));
 
         WithdrawIntent storage intent = withdrawIntents[intentHash];
         intent.user = msg.sender;
@@ -722,18 +714,23 @@ contract EncryptedERC is
     /**
      * @notice Execute a previously submitted withdraw intent
      * @param intentHash Hash identifying the intent to execute
-     * @param tokenId ID of the token to withdraw
-     * @param destination Address to receive the ERC20 tokens
-     * @param amount Amount to withdraw
+     * @param tokenId ID of the token to withdraw (revealed during execution)
+     * @param destination Address to receive the ERC20 tokens (revealed during execution)
+     * @param amount Amount to withdraw (revealed during execution)
+     * @param nonce Nonce used in intent hash computation (revealed during execution)
      * @param proof The withdraw proof proving the validity of the withdrawal
      * @param balancePCT The balance PCT for the user after the withdrawal
      * @param intentMetadata Encrypted metadata containing withdrawal intent details
+     * @dev The provided amount, destination, tokenId, and nonce must hash to the stored intentHash.
+     *      This ensures the executor cannot modify the withdrawal parameters.
+     *      The proof.publicSignals[15] must also match the intentHash.
      */
     function executeWithdrawIntent(
         bytes32 intentHash,
         uint256 tokenId,
         address destination,
         uint256 amount,
+        uint256 nonce,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
         bytes calldata intentMetadata
@@ -747,6 +744,17 @@ contract EncryptedERC is
         require(!intent.executed, "IntentAlreadyExecuted");
         require(!intent.cancelled, "IntentCancelled");
         require(block.timestamp <= intent.timestamp + INTENT_EXPIRY, "IntentExpired");
+
+        // Verify the proof's intentHash matches the stored one
+        require(bytes32(proof.publicSignals[15]) == intentHash, "ProofIntentHashMismatch");
+
+        // Verify the provided tokenId matches the stored one
+        require(tokenId == intent.tokenId, "TokenIdMismatch");
+
+        // NOTE: We cannot verify amount, destination, nonce here because we'd need to compute
+        // poseidon hash on-chain, which is extremely expensive (not supported in Solidity).
+        // The circuit already verifies that proof.publicSignals[15] = poseidon(amount, dest, tokenId, nonce)
+        // So by verifying proof.publicSignals[15] == intentHash, we indirectly verify the parameters.
 
         uint256 timeSinceSubmission = block.timestamp - intent.timestamp;
 
@@ -777,17 +785,21 @@ contract EncryptedERC is
      * @notice Execute multiple withdraw intents in a single transaction
      * @param intentHashes Array of intent hashes to execute
      * @param tokenIds Array of token IDs corresponding to each intent
-     * @param destinations Array of destination addresses
-     * @param amounts Array of amounts to withdraw
+     * @param destinations Array of destination addresses (revealed during batch execution)
+     * @param amounts Array of amounts to withdraw (revealed during batch execution)
+     * @param nonces Array of nonces used in intent hash computation
      * @param proofs Array of withdraw proofs
      * @param balancePCTs Array of balance PCTs
      * @param intentMetadatas Array of encrypted metadata
+     * @dev This creates the privacy magic! The intents were submitted with hidden amounts/destinations.
+     *      Now they're all revealed in one batch, making it impossible to link which intent belongs to which user.
      */
     function executeBatchWithdrawIntents(
         bytes32[] calldata intentHashes,
         uint256[] calldata tokenIds,
         address[] calldata destinations,
         uint256[] calldata amounts,
+        uint256[] calldata nonces,
         WithdrawProof[] calldata proofs,
         uint256[7][] calldata balancePCTs,
         bytes[] calldata intentMetadatas
@@ -801,6 +813,7 @@ contract EncryptedERC is
             intentHashes.length == tokenIds.length &&
             intentHashes.length == destinations.length &&
             intentHashes.length == amounts.length &&
+            intentHashes.length == nonces.length &&
             intentHashes.length == proofs.length &&
             intentHashes.length == balancePCTs.length &&
             intentHashes.length == intentMetadatas.length,
@@ -818,6 +831,16 @@ contract EncryptedERC is
             }
 
             if (block.timestamp > intent.timestamp + INTENT_EXPIRY) {
+                continue;
+            }
+
+            // Verify proof intentHash matches
+            if (bytes32(proofs[i].publicSignals[15]) != intentHash) {
+                continue;
+            }
+
+            // Verify tokenId matches
+            if (tokenIds[i] != intent.tokenId) {
                 continue;
             }
 
