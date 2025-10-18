@@ -18,7 +18,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {CreateEncryptedERCParams, Point, EGCT, EncryptedBalance, AmountPCT, MintProof, TransferProof, WithdrawProof, BurnProof, TransferInputs} from "./types/Types.sol";
 
 // errors
-import {UserNotRegistered, InvalidProof, TransferFailed, UnknownToken, InvalidChainId, InvalidNullifier, ZeroAddress} from "./errors/Errors.sol";
+import {UserNotRegistered, InvalidProof, TransferFailed, UnknownToken, InvalidChainId, InvalidNullifier, ZeroAddress, PendingIntentExists, BalanceLocked} from "./errors/Errors.sol";
 
 // interfaces
 import {IRegistrar} from "./interfaces/IRegistrar.sol";
@@ -82,6 +82,46 @@ contract EncryptedERC is
 
     /// @notice Mapping to track used mint nullifiers to prevent double-minting
     mapping(uint256 mintNullifier => bool isUsed) public alreadyMinted;
+
+    /// @notice Two-step intent system state variables
+    /// @dev Stores withdraw intents indexed by intent hash
+    mapping(bytes32 intentHash => WithdrawIntent) public withdrawIntents;
+
+    /// @notice Counter for generating unique intent IDs
+    uint256 public nextIntentId;
+
+    /// @notice Time delay before permissionless execution (1 hour for user-only, 24 hours for permissionless)
+    uint256 public constant USER_ONLY_DELAY = 1 hours;
+    uint256 public constant PERMISSIONLESS_DELAY = 24 hours;
+
+    /// @notice Maximum intent expiry period (30 days)
+    uint256 public constant INTENT_EXPIRY = 30 days;
+
+    /// @notice Maximum batch size for batch execution
+    uint256 public constant MAX_BATCH_SIZE = 50;
+
+    ///////////////////////////////////////////////////
+    ///                    Structs                  ///
+    ///////////////////////////////////////////////////
+
+    /**
+     * @notice Represents a two-step withdraw intent
+     * @param user Address of the user who created the intent
+     * @param timestamp When the intent was submitted
+     * @param executed Whether the intent has been executed
+     * @param cancelled Whether the intent has been cancelled
+     */
+    struct WithdrawIntent {
+        address user;
+        uint256 tokenId;
+        uint256 timestamp;
+        bool executed;
+        bool cancelled;
+    }
+
+    // Mapping to track if a user has a pending intent for a specific token
+    // user => tokenId => hasPendingIntent
+    mapping(address => mapping(uint256 => bool)) public pendingIntents;
 
     ///////////////////////////////////////////////////
     ///                    Events                   ///
@@ -172,6 +212,60 @@ contract EncryptedERC is
         string operationType
     );
 
+    /**
+     * @notice Emitted when a withdraw intent is submitted
+     * @param intentHash Unique hash identifying the intent
+     * @param user Address of the user who submitted the intent
+     * @param intentId Sequential intent ID for tracking
+     * @param timestamp When the intent was submitted
+     * @dev This event provides basic intent tracking while keeping details private
+     */
+    event WithdrawIntentSubmitted(
+        bytes32 indexed intentHash,
+        address indexed user,
+        uint256 intentId,
+        uint256 timestamp
+    );
+
+    /**
+     * @notice Emitted when a withdraw intent is executed
+     * @param intentHash Unique hash identifying the intent
+     * @param executor Address of the relayer who executed the intent
+     * @param timestamp When the intent was executed
+     * @dev This event tracks intent execution without revealing amounts
+     */
+    event WithdrawIntentExecuted(
+        bytes32 indexed intentHash,
+        address indexed executor,
+        uint256 timestamp
+    );
+
+    /**
+     * @notice Emitted when a withdraw intent is cancelled
+     * @param intentHash Unique hash identifying the intent
+     * @param user Address of the user who cancelled the intent
+     * @param timestamp When the intent was cancelled
+     * @dev Only the original creator can cancel their intent
+     */
+    event WithdrawIntentCancelled(
+        bytes32 indexed intentHash,
+        address indexed user,
+        uint256 timestamp
+    );
+
+    /**
+     * @notice Emitted when a batch of withdraw intents is executed
+     * @param executor Address of the relayer who executed the batch
+     * @param intentCount Number of intents executed in the batch
+     * @param timestamp When the batch was executed
+     * @dev This event provides batch execution tracking
+     */
+    event BatchWithdrawIntentsExecuted(
+        address indexed executor,
+        uint256 intentCount,
+        uint256 timestamp
+    );
+
     ///////////////////////////////////////////////////
     ///                   Modifiers                 ///
     ///////////////////////////////////////////////////
@@ -179,6 +273,18 @@ contract EncryptedERC is
         bool isRegistered = registrar.isUserRegistered(user);
         if (!isRegistered) {
             revert UserNotRegistered();
+        }
+        _;
+    }
+
+    /**
+     * @notice Modifier to check that user's balance is not locked by a pending intent
+     * @param user The user address to check
+     * @param tokenId The token ID to check
+     */
+    modifier onlyIfBalanceUnlocked(address user, uint256 tokenId) {
+        if (pendingIntents[user][tokenId]) {
+            revert BalanceLocked();
         }
         _;
     }
@@ -528,16 +634,21 @@ contract EncryptedERC is
     /**
      * @notice Withdraws encrypted tokens using intent-based metadata for privacy
      * @param tokenId ID of the token to withdraw
+     * @param destination Address to receive the ERC20 tokens (can be any address, doesn't need to be registered)
+     * @param amount Amount to withdraw
      * @param proof The withdraw proof proving the validity of the withdrawal
      * @param balancePCT The balance PCT for the user after the withdrawal
      * @param intentMetadata Encrypted metadata containing withdrawal intent details (amount, destination, memo)
-     * @dev This function provides enhanced privacy by not emitting a public Withdraw event.
-     *      Instead, it emits only a PrivateOperation event and PrivateMessage with encrypted metadata.
-     *      The withdrawal amount is still validated by the ZK proof but not exposed in events.
+     * @dev This function provides enhanced privacy by:
+     *      - Not emitting a public Withdraw event (only PrivateOperation event)
+     *      - Allowing withdrawal to any address (breaks on-chain linkability)
+     *      - Hiding withdrawal amount in events (only in encrypted metadata)
+     *      The destination address does not need to be registered, allowing unwrapping to fresh addresses.
      *      Only the user can decrypt the intent metadata to see withdrawal details.
      */
     function withdrawWithIntent(
         uint256 tokenId,
+        address destination,
         uint256 amount,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
@@ -548,7 +659,240 @@ contract EncryptedERC is
         onlyForConverter
         onlyIfUserRegistered(msg.sender)
     {
-        _executeWithdrawWithIntent(tokenId, amount, proof, balancePCT, intentMetadata);
+        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
+    }
+
+    /**
+     * @notice Submit a withdraw intent for later execution (two-step process for enhanced privacy)
+     * @param tokenId ID of the token to withdraw
+     * @param destination Address to receive the ERC20 tokens
+     * @param amount Amount to withdraw
+     * @param proof The withdraw proof proving the validity of the withdrawal
+     * @param balancePCT The balance PCT for the user after the withdrawal
+     * @param intentMetadata Encrypted metadata containing withdrawal intent details
+     * @return intentHash Unique hash identifying this intent
+     */
+    function submitWithdrawIntent(
+        uint256 tokenId,
+        address destination,
+        uint256 amount,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes calldata intentMetadata
+    )
+        external
+        onlyIfAuditorSet
+        onlyForConverter
+        onlyIfUserRegistered(msg.sender)
+        returns (bytes32 intentHash)
+    {
+        // Check if user already has a pending intent for this token
+        if (pendingIntents[msg.sender][tokenId]) {
+            revert PendingIntentExists();
+        }
+
+        uint256 intentId = nextIntentId++;
+        intentHash = keccak256(abi.encodePacked(
+            msg.sender,
+            tokenId,
+            destination,
+            amount,
+            proof.publicSignals,
+            balancePCT,
+            intentMetadata,
+            intentId,
+            block.timestamp
+        ));
+
+        WithdrawIntent storage intent = withdrawIntents[intentHash];
+        intent.user = msg.sender;
+        intent.tokenId = tokenId;
+        intent.timestamp = block.timestamp;
+        intent.executed = false;
+        intent.cancelled = false;
+
+        // Lock the balance for this token
+        pendingIntents[msg.sender][tokenId] = true;
+
+        emit WithdrawIntentSubmitted(intentHash, msg.sender, intentId, block.timestamp);
+
+        return intentHash;
+    }
+
+    /**
+     * @notice Execute a previously submitted withdraw intent
+     * @param intentHash Hash identifying the intent to execute
+     * @param tokenId ID of the token to withdraw
+     * @param destination Address to receive the ERC20 tokens
+     * @param amount Amount to withdraw
+     * @param proof The withdraw proof proving the validity of the withdrawal
+     * @param balancePCT The balance PCT for the user after the withdrawal
+     * @param intentMetadata Encrypted metadata containing withdrawal intent details
+     */
+    function executeWithdrawIntent(
+        bytes32 intentHash,
+        uint256 tokenId,
+        address destination,
+        uint256 amount,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes calldata intentMetadata
+    )
+        external
+        onlyIfAuditorSet
+    {
+        WithdrawIntent storage intent = withdrawIntents[intentHash];
+
+        require(intent.user != address(0), "IntentNotFound");
+        require(!intent.executed, "IntentAlreadyExecuted");
+        require(!intent.cancelled, "IntentCancelled");
+        require(block.timestamp <= intent.timestamp + INTENT_EXPIRY, "IntentExpired");
+
+        uint256 timeSinceSubmission = block.timestamp - intent.timestamp;
+
+        if (timeSinceSubmission < USER_ONLY_DELAY) {
+            require(msg.sender == intent.user, "TooEarlyForRelayer");
+        } else if (timeSinceSubmission < PERMISSIONLESS_DELAY) {
+            require(msg.sender == intent.user, "TooEarlyForPermissionless");
+        }
+
+        intent.executed = true;
+
+        // Unlock the balance
+        pendingIntents[intent.user][intent.tokenId] = false;
+
+        _executeWithdrawWithIntent(
+            tokenId,
+            destination,
+            amount,
+            proof,
+            balancePCT,
+            intentMetadata
+        );
+
+        emit WithdrawIntentExecuted(intentHash, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice Execute multiple withdraw intents in a single transaction
+     * @param intentHashes Array of intent hashes to execute
+     * @param tokenIds Array of token IDs corresponding to each intent
+     * @param destinations Array of destination addresses
+     * @param amounts Array of amounts to withdraw
+     * @param proofs Array of withdraw proofs
+     * @param balancePCTs Array of balance PCTs
+     * @param intentMetadatas Array of encrypted metadata
+     */
+    function executeBatchWithdrawIntents(
+        bytes32[] calldata intentHashes,
+        uint256[] calldata tokenIds,
+        address[] calldata destinations,
+        uint256[] calldata amounts,
+        WithdrawProof[] calldata proofs,
+        uint256[7][] calldata balancePCTs,
+        bytes[] calldata intentMetadatas
+    )
+        external
+        onlyIfAuditorSet
+    {
+        require(intentHashes.length > 0, "EmptyBatch");
+        require(intentHashes.length <= MAX_BATCH_SIZE, "BatchTooLarge");
+        require(
+            intentHashes.length == tokenIds.length &&
+            intentHashes.length == destinations.length &&
+            intentHashes.length == amounts.length &&
+            intentHashes.length == proofs.length &&
+            intentHashes.length == balancePCTs.length &&
+            intentHashes.length == intentMetadatas.length,
+            "ArrayLengthMismatch"
+        );
+
+        uint256 successCount = 0;
+
+        for (uint256 i = 0; i < intentHashes.length; i++) {
+            bytes32 intentHash = intentHashes[i];
+            WithdrawIntent storage intent = withdrawIntents[intentHash];
+
+            if (intent.user == address(0) || intent.executed || intent.cancelled) {
+                continue;
+            }
+
+            if (block.timestamp > intent.timestamp + INTENT_EXPIRY) {
+                continue;
+            }
+
+            uint256 timeSinceSubmission = block.timestamp - intent.timestamp;
+
+            if (timeSinceSubmission < USER_ONLY_DELAY) {
+                if (msg.sender != intent.user) {
+                    continue;
+                }
+            } else if (timeSinceSubmission < PERMISSIONLESS_DELAY) {
+                if (msg.sender != intent.user) {
+                    continue;
+                }
+            }
+
+            intent.executed = true;
+
+            // Unlock the balance
+            pendingIntents[intent.user][intent.tokenId] = false;
+
+            try this._executeWithdrawIntentExternal(
+                tokenIds[i],
+                destinations[i],
+                amounts[i],
+                proofs[i],
+                balancePCTs[i],
+                intentMetadatas[i]
+            ) {
+                emit WithdrawIntentExecuted(intentHash, msg.sender, block.timestamp);
+                successCount++;
+            } catch {
+                intent.executed = false;
+                // Re-lock on failure
+                pendingIntents[intent.user][intent.tokenId] = true;
+            }
+        }
+
+        emit BatchWithdrawIntentsExecuted(msg.sender, successCount, block.timestamp);
+    }
+
+    /**
+     * @notice Cancel a previously submitted withdraw intent
+     * @param intentHash Hash identifying the intent to cancel
+     */
+    function cancelWithdrawIntent(bytes32 intentHash)
+        external
+    {
+        WithdrawIntent storage intent = withdrawIntents[intentHash];
+
+        require(intent.user != address(0), "IntentNotFound");
+        require(intent.user == msg.sender, "OnlyIntentCreator");
+        require(!intent.executed, "IntentAlreadyExecuted");
+        require(!intent.cancelled, "IntentAlreadyCancelled");
+
+        intent.cancelled = true;
+
+        // Unlock the balance
+        pendingIntents[intent.user][intent.tokenId] = false;
+
+        emit WithdrawIntentCancelled(intentHash, msg.sender, block.timestamp);
+    }
+
+    /**
+     * @notice External wrapper for _executeWithdrawWithIntent used in batch execution
+     */
+    function _executeWithdrawIntentExternal(
+        uint256 tokenId,
+        address destination,
+        uint256 amount,
+        WithdrawProof memory proof,
+        uint256[7] memory balancePCT,
+        bytes memory intentMetadata
+    ) external {
+        require(msg.sender == address(this), "OnlyInternal");
+        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
     }
 
     function sendEncryptedMetadata(
@@ -640,6 +984,57 @@ contract EncryptedERC is
 
         // Convert and transfer the tokens
         _convertTo(from, amount, tokenAddress);
+    }
+
+    /**
+     * @notice Internal function for withdrawal to a specific destination address
+     * @param from Address of the user performing the withdrawal (owns the encrypted balance)
+     * @param destination Address to receive the ERC20 tokens (can be any address)
+     * @param amount Amount to withdraw
+     * @param tokenId ID of the token to withdraw
+     * @param publicInputs Public inputs from the proof
+     * @param balancePCT The balance PCT for the user after the withdrawal
+     * @dev This function allows withdrawing to any address, not just msg.sender.
+     *      The encrypted balance is reduced from 'from' (the registered user),
+     *      but the ERC20 tokens are sent to 'destination' (can be unregistered).
+     */
+    function _withdrawTo(
+        address from,
+        address destination,
+        uint256 amount,
+        uint256 tokenId,
+        uint256[16] memory publicInputs,
+        uint256[7] memory balancePCT
+    ) internal {
+        address tokenAddress = tokenAddresses[tokenId];
+        if (tokenAddress == address(0)) {
+            revert UnknownToken();
+        }
+
+        {
+            // Extract the provided balance from the proof
+            EGCT memory providedBalance = EGCT({
+                c1: Point({x: publicInputs[3], y: publicInputs[4]}),
+                c2: Point({x: publicInputs[5], y: publicInputs[6]})
+            });
+
+            // Encrypt the withdrawn amount
+            EGCT memory encryptedWithdrawnAmount = BabyJubJub.encrypt(
+                Point({x: publicInputs[1], y: publicInputs[2]}),
+                amount
+            );
+
+            _privateBurn(
+                from,
+                tokenId,
+                providedBalance,
+                encryptedWithdrawnAmount,
+                balancePCT
+            );
+        }
+
+        // Convert and transfer the tokens to the destination address
+        _convertTo(destination, amount, tokenAddress);
     }
 
     /**
@@ -1138,6 +1533,7 @@ contract EncryptedERC is
      */
     function _executeWithdrawWithIntent(
         uint256 tokenId,
+        address destination,
         uint256 amount,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
@@ -1192,8 +1588,8 @@ contract EncryptedERC is
         remappedInputs[14] = publicInputs[13]; // AuditorPCTAuthKey[1]
         remappedInputs[15] = publicInputs[14]; // AuditorPCTNonce
 
-        // Perform the withdrawal
-        _withdraw(from, amount, tokenId, remappedInputs, balancePCT);
+        // Perform the withdrawal to the specified destination
+        _withdrawTo(from, destination, amount, tokenId, remappedInputs, balancePCT);
 
         // Emit private operation event (no amount details)
         emit PrivateOperation(from, "WITHDRAW_INTENT");

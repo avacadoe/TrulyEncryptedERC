@@ -19,3 +19,5 @@ error InvalidSender();
 error InvalidRegistrationHash();
 error ZeroAddress();
 error TokenBlacklisted(address token);
+error PendingIntentExists();
+error BalanceLocked();

@@ -184,10 +184,10 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			const auditorPublicKey = users[2].publicKey;
 
 			// Generate withdraw intent proof with private amount
-			const destination = BigInt(users[0].signer.address);
+			const destination = users[0].signer.address; // Withdraw to self
 			const nonce = 1n;
 
-			const { proof: calldata, userBalancePCT, intentHash } = await withdrawIntent(
+			const { proof: calldata, userBalancePCT, destinationAddress } = await withdrawIntent(
 				withdrawAmount,
 				destination,
 				tokenId,
@@ -205,7 +205,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			// 5. Execute withdrawWithIntent
 			const withdrawTx = await encryptedERC
 				.connect(users[0].signer)
-				.withdrawWithIntent(tokenId, withdrawAmount, calldata, userBalancePCT, encryptedMetadata);
+				.withdrawWithIntent(tokenId, destinationAddress, withdrawAmount, calldata, userBalancePCT, encryptedMetadata);
 
 			const receipt = await withdrawTx.wait();
 
@@ -301,6 +301,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			await expect(
 				encryptedERC.connect(unregisteredSigner).withdrawWithIntent(
 					1n,
+					unregisteredSigner.address,
 					100n,
 					{
 						proofPoints: {
@@ -342,6 +343,7 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 			await expect(
 				encryptedERC.connect(users[0].getSigner()).withdrawWithIntent(
 					1n,
+					users[0].getAddress(),
 					100n,
 					{
 						proofPoints: {
@@ -358,6 +360,96 @@ describe("EncryptedERC - Intent-Based Withdrawals", () => {
 					"0x1234", // encrypted metadata
 				),
 			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
+		});
+
+		it("should successfully withdraw to an unregistered address", async () => {
+			// 1. Deposit tokens first
+			const depositAmount = ethers.parseUnits("100", DECIMALS);
+			const withdrawAmount = ethers.parseUnits("50", DECIMALS);
+
+			const {
+				ciphertext: depositCiphertext,
+				nonce: depositNonce,
+				authKey: depositAuthKey,
+			} = processPoseidonEncryption([depositAmount], users[0].publicKey);
+
+			const depositTx = await encryptedERC
+				.connect(users[0].signer)
+				["deposit(uint256,address,uint256[7])"](
+					depositAmount,
+					erc20.target,
+					[...depositCiphertext, ...depositAuthKey, depositNonce],
+				);
+			await depositTx.wait();
+
+			const tokenId = await encryptedERC.tokenIds(erc20.target);
+
+			// 2. Get balance
+			const balance = await encryptedERC.balanceOf(
+				users[0].signer.address,
+				tokenId,
+			);
+
+			const userInitialBalance = await getDecryptedBalance(
+				users[0].privateKey,
+				balance.amountPCTs,
+				balance.balancePCT,
+				balance.eGCT,
+			);
+
+			expect(userInitialBalance).to.equal(depositAmount);
+
+			// 3. Use an unregistered address as destination
+			const unregisteredDestination = signers[10].address;
+			const userEncryptedBalance = [...balance.eGCT.c1, ...balance.eGCT.c2];
+			const auditorPublicKey = users[2].publicKey;
+			const nonce = 1n;
+
+			const { proof: calldata, userBalancePCT, destinationAddress } = await withdrawIntent(
+				withdrawAmount,
+				unregisteredDestination,
+				tokenId,
+				nonce,
+				users[0],
+				userEncryptedBalance,
+				userInitialBalance,
+				auditorPublicKey,
+			);
+
+			// 4. Execute withdrawWithIntent to unregistered address
+			const MESSAGE = "Withdrawing to fresh address for privacy";
+			const encryptedMetadata = encryptMetadata(users[0].publicKey, MESSAGE);
+
+			const withdrawTx = await encryptedERC
+				.connect(users[0].signer)
+				.withdrawWithIntent(tokenId, destinationAddress, withdrawAmount, calldata, userBalancePCT, encryptedMetadata);
+
+			await withdrawTx.wait();
+
+			// 5. Verify ERC20 tokens went to the unregistered address (not msg.sender)
+			const destinationERC20Balance = await erc20.balanceOf(unregisteredDestination);
+			expect(destinationERC20Balance).to.equal(withdrawAmount);
+
+			// 6. Verify msg.sender did NOT receive the tokens
+			const senderERC20Balance = await erc20.balanceOf(users[0].signer.address);
+			// User had 1000 tokens, deposited 100, so has 900
+			const expectedSenderBalance = ethers.parseUnits("1000", DECIMALS) - depositAmount;
+			expect(senderERC20Balance).to.equal(expectedSenderBalance);
+
+			// 7. Verify encrypted balance was updated for msg.sender (not destination)
+			const balanceAfterWithdraw = await encryptedERC.balanceOf(
+				users[0].signer.address,
+				tokenId,
+			);
+			const newDecryptedBalance = await getDecryptedBalance(
+				users[0].privateKey,
+				balanceAfterWithdraw.amountPCTs,
+				balanceAfterWithdraw.balancePCT,
+				balanceAfterWithdraw.eGCT,
+			);
+
+			const expectedNewBalance = userInitialBalance - withdrawAmount;
+			expect(newDecryptedBalance).to.equal(expectedNewBalance);
 		});
 	});
 });

@@ -518,7 +518,7 @@ export const getDecryptedBalance = async (
 /**
  * Function for withdrawing tokens privately using intent-based withdrawal with private amount
  * @param amount Amount to be withdrawn
- * @param destination Destination address
+ * @param destination Destination address (as bigint or string)
  * @param tokenId Token ID
  * @param nonce Intent nonce
  * @param user User object
@@ -528,10 +528,11 @@ export const getDecryptedBalance = async (
  * @returns proof - Proof and public inputs for the generated proof
  * @returns userBalancePCT - User's balance after the withdrawal encrypted with Poseidon encryption
  * @returns intentHash - Hash of the intent (amount, destination, tokenId, nonce)
+ * @returns destinationAddress - The destination address as a string (for contract calls)
  */
 export const withdrawIntent = async (
 	amount: bigint,
-	destination: bigint,
+	destination: bigint | string,
 	tokenId: bigint,
 	nonce: bigint,
 	user: User,
@@ -542,12 +543,17 @@ export const withdrawIntent = async (
 	proof: CalldataWithdrawIntentCircuitGroth16;
 	userBalancePCT: bigint[];
 	intentHash: bigint;
+	destinationAddress: string;
 }> => {
 	const newBalance = userBalance - amount;
 	const userPublicKey = user.publicKey;
 
+	// Convert destination to bigint if it's a string address
+	const destinationBigInt = typeof destination === "string" ? BigInt(destination) : destination;
+	const destinationAddress = typeof destination === "string" ? destination : `0x${destination.toString(16).padStart(40, "0")}`;
+
 	// 1. Compute intent hash: hash(amount, destination, tokenId, nonce)
-	const intentHash = poseidon([amount, destination, tokenId, nonce]);
+	const intentHash = poseidon([amount, destinationBigInt, tokenId, nonce]);
 
 	// 2. create pct for the user with the newly calculated balance
 	const {
@@ -566,7 +572,7 @@ export const withdrawIntent = async (
 
 	const input = {
 		ValueToWithdraw: amount,
-		Destination: destination,
+		Destination: destinationBigInt,
 		TokenId: tokenId,
 		Nonce: nonce,
 		SenderPrivateKey: user.formattedPrivateKey,
@@ -592,5 +598,6 @@ export const withdrawIntent = async (
 		proof: calldata,
 		userBalancePCT: [...userCiphertext, ...userAuthKey, userNonce],
 		intentHash,
+		destinationAddress,
 	};
 };

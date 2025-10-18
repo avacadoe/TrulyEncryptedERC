@@ -20,6 +20,7 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 200,
       },
+      viaIR: true,
     },
   },
   networks: {
@@ -29,6 +30,11 @@ const config: HardhatUserConfig = {
         blockNumber: 59121339,
         enabled: !!process.env.FORKING,
       },
+    },
+    fuji: {
+      url: "https://api.avax-test.network/ext/bc/C/rpc",
+      chainId: 43113,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
     },
   },
   gasReporter: {
