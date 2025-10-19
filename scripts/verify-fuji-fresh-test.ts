@@ -13,11 +13,11 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// Deployed contract addresses on Fuji
+// Deployed contract addresses on Fuji (Updated with private intent fix)
 const CONTRACTS = {
-	registrar: "0xe3e9F5B05ED3cD1b9d7B67607276C8f333e16408",
-	encryptedERC: "0x1E8617263656B945087bC4bEaaB530Af6fD844dD",
-	erc20: "0xA4DeF71A5848768e4E33256aFfc2E83733DE424a",
+	registrar: "0x94c03c17eb6a0d7CAc606A02550Ac5CC69547352",
+	encryptedERC: "0x3C5FD63b7a9f0487BA6fB0117764032a2eA3970c",
+	erc20: "0xa4fE0D34b90470d19B62Faf82216Be8eF3538406",
 };
 
 const ERC20_DECIMALS = 18;
@@ -82,7 +82,32 @@ async function main() {
 	await registerTx.wait();
 	console.log(`✓ Test user registered with current ZK keys`);
 
-	console.log("\n=== Step 2: Set Auditor ===");
+	console.log("\n=== Step 2: Register Relayer (for Auditor Role) ===");
+	// Check if relayer is already registered
+	const relayerPubKey = await registrar.getUserPublicKey(relayerWallet.address);
+	if (relayerPubKey[0] === 0n && relayerPubKey[1] === 0n) {
+		console.log(`  Relayer not registered. Registering...`);
+		const relayerRegistrationHash = relayerUser.genRegistrationHash(chainId);
+		const relayerInput = {
+			SenderPrivateKey: relayerUser.formattedPrivateKey,
+			SenderPublicKey: relayerUser.publicKey,
+			SenderAddress: BigInt(relayerUser.signer.address),
+			ChainID: chainId,
+			RegistrationHash: relayerRegistrationHash,
+		};
+		const relayerProof = await (registrationCircuit as unknown as RegistrationCircuit).generateProof(relayerInput);
+		const relayerCalldata = await (registrationCircuit as unknown as RegistrationCircuit).generateCalldata(relayerProof);
+		const relayerRegisterTx = await registrar.connect(relayerUser.signer).register({
+			proofPoints: relayerCalldata.proofPoints,
+			publicSignals: relayerCalldata.publicSignals,
+		});
+		await relayerRegisterTx.wait();
+		console.log(`✓ Relayer registered`);
+	} else {
+		console.log(`✓ Relayer already registered: [${relayerPubKey[0]}, ${relayerPubKey[1]}]`);
+	}
+
+	console.log("\n=== Step 3: Set Auditor ===");
 	// Check if auditor is already set
 	const currentAuditor = await encryptedERC.auditorPublicKey();
 	if (currentAuditor[0] === 0n && currentAuditor[1] === 0n) {
@@ -94,18 +119,18 @@ async function main() {
 		console.log(`✓ Auditor already set: [${currentAuditor[0]}, ${currentAuditor[1]}]`);
 	}
 
-	console.log("\n=== Step 3: Mint ERC20 to Test User ===");
+	console.log("\n=== Step 4: Mint ERC20 to Test User ===");
 	const mintAmount = ethers.parseUnits("1000", ERC20_DECIMALS);
 	const mintTx = await erc20.connect(deployerWallet).mint(testUser.signer.address, mintAmount);
 	await mintTx.wait();
 	console.log(`✓ Minted 1000 TEST tokens to test user`);
 
-	console.log("\n=== Step 4: Test User Approves EncryptedERC ===");
+	console.log("\n=== Step 5: Test User Approves EncryptedERC ===");
 	const approveTx = await erc20.connect(testUser.signer).approve(encryptedERC.target, mintAmount);
 	await approveTx.wait();
 	console.log(`✓ Approved EncryptedERC to spend tokens`);
 
-	console.log("\n=== Step 5: Test User Deposits ===");
+	console.log("\n=== Step 6: Test User Deposits ===");
 	const depositAmount = ethers.parseUnits("100", ERC20_DECIMALS);
 	const {
 		ciphertext: depositCiphertext,
@@ -123,7 +148,7 @@ async function main() {
 	await depositTx.wait();
 	console.log(`✓ Deposited ${ethers.formatUnits(depositAmount, ERC20_DECIMALS)} TEST tokens`);
 
-	console.log("\n=== Step 6: Get Test User's Encrypted Balance ===");
+	console.log("\n=== Step 7: Get Test User's Encrypted Balance ===");
 	const tokenId = await encryptedERC.tokenIds(erc20.target);
 	const balance = await encryptedERC.balanceOf(testUser.signer.address, tokenId);
 
@@ -135,29 +160,20 @@ async function main() {
 	console.log(`  ERC20 deposit amount: ${ethers.formatUnits(depositAmount, ERC20_DECIMALS)} TEST`);
 	console.log(`  Scaled encrypted balance: ${userBalance} (in ${ENCRYPTED_ERC_DECIMALS} decimal units)`);
 
-	console.log("\n=== Step 7: Submit Withdraw Intent ===");
+	console.log("\n=== Step 8: Submit Withdraw Intent (PRIVATE!) ===");
 	// Withdraw amount needs to be in the SCALED units (2 decimals)
 	const withdrawAmount = userBalance / 2n; // Withdraw half the balance
-
-	// Debug the encrypted balance structure
-	console.log(`  Debug - balance.eGCT.c1: [${balance.eGCT.c1.x}, ${balance.eGCT.c1.y}]`);
-	console.log(`  Debug - balance.eGCT.c2: [${balance.eGCT.c2.x}, ${balance.eGCT.c2.y}]`);
-	console.log(`  Debug - balance.nonce: ${balance.nonce}`);
-	console.log(`  Debug - testUser.publicKey: [${testUser.publicKey}]`);
-	console.log(`  Debug - withdrawAmount: ${withdrawAmount}`);
-	console.log(`  Debug - userBalance: ${userBalance}`);
 
 	const userEncryptedBalance = [balance.eGCT.c1.x, balance.eGCT.c1.y, balance.eGCT.c2.x, balance.eGCT.c2.y];
 
 	// Get the actual auditor public key from the contract
 	const auditorPubKeyFromContract = await encryptedERC.auditorPublicKey();
 	const auditorPublicKey = [auditorPubKeyFromContract[0], auditorPubKeyFromContract[1]];
-	console.log(`  Using auditor public key from contract: [${auditorPublicKey[0]}, ${auditorPublicKey[1]}]`);
 
 	const destination = testUser.signer.address;
 	const nonce = 1n;
 
-	const { proof: withdrawCalldata, userBalancePCT } = await withdrawIntent(
+	const { proof: withdrawCalldata, userBalancePCT, intentHash: intentHashBigInt } = await withdrawIntent(
 		withdrawAmount,
 		destination,
 		tokenId,
@@ -168,15 +184,20 @@ async function main() {
 		auditorPublicKey,
 	);
 
-	const MESSAGE = "Testing time-based permissions on Fuji";
+	const MESSAGE = "Testing PRIVATE intents - amount/destination hidden!";
 	const encryptedMetadata = encryptMetadata(testUser.publicKey, MESSAGE);
 
+	console.log(`  💰 Withdraw amount: ${withdrawAmount} units (${ethers.formatUnits(withdrawAmount * (10n ** 16n), ERC20_DECIMALS)} TEST)`);
+	console.log(`  🎯 Destination: ${destination}`);
+	console.log(`  🔒 Intent hash: 0x${intentHashBigInt.toString(16).padStart(64, "0")}`);
+	console.log(`  ⚠️  Amount and destination will NOT be visible in the transaction!`);
+
+	// NEW: submitWithdrawIntent now only takes tokenId, proof, balancePCT, metadata
+	// Amount and destination are HIDDEN!
 	const submitTx = await encryptedERC
 		.connect(testUser.signer)
 		.submitWithdrawIntent(
 			tokenId,
-			destination,
-			withdrawAmount,
 			withdrawCalldata,
 			userBalancePCT,
 			encryptedMetadata,
@@ -207,7 +228,7 @@ async function main() {
 	console.log(`  Submit time: ${new Date(Number(submitBlock?.timestamp) * 1000).toISOString()}`);
 	console.log(`  Intent timestamp: ${intent.timestamp}`);
 
-	console.log("\n=== Step 8: Test User Executes Immediately ===");
+	console.log("\n=== Step 9: Test User Executes Immediately ===");
 	try {
 		const userExecuteTx = await encryptedERC
 			.connect(testUser.signer)
@@ -216,6 +237,7 @@ async function main() {
 				tokenId,
 				destination,
 				withdrawAmount,
+				nonce,
 				withdrawCalldata,
 				userBalancePCT,
 				encryptedMetadata,
@@ -240,6 +262,7 @@ async function main() {
 					tokenId,
 					destination,
 					withdrawAmount,
+					nonce,
 					withdrawCalldata,
 					userBalancePCT,
 					encryptedMetadata,

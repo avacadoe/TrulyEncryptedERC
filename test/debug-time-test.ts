@@ -218,8 +218,6 @@ describe("DEBUG: Time Advancement Investigation", () => {
 			.connect(users[0].signer)
 			.submitWithdrawIntent(
 				tokenId,
-				destination,
-				withdrawAmount,
 				calldata,
 				userBalancePCT,
 				encryptedMetadata,
