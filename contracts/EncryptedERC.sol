@@ -659,7 +659,7 @@ contract EncryptedERC is
         onlyForConverter
         onlyIfUserRegistered(msg.sender)
     {
-        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
+        _executeWithdrawWithIntent(msg.sender, tokenId, destination, amount, proof, balancePCT, intentMetadata);
     }
 
     /**
@@ -770,6 +770,7 @@ contract EncryptedERC is
         pendingIntents[intent.user][intent.tokenId] = false;
 
         _executeWithdrawWithIntent(
+            intent.user,
             tokenId,
             destination,
             amount,
@@ -862,6 +863,7 @@ contract EncryptedERC is
             pendingIntents[intent.user][intent.tokenId] = false;
 
             try this._executeWithdrawIntentExternal(
+                intent.user,
                 tokenIds[i],
                 destinations[i],
                 amounts[i],
@@ -907,6 +909,7 @@ contract EncryptedERC is
      * @notice External wrapper for _executeWithdrawWithIntent used in batch execution
      */
     function _executeWithdrawIntentExternal(
+        address user,
         uint256 tokenId,
         address destination,
         uint256 amount,
@@ -915,7 +918,7 @@ contract EncryptedERC is
         bytes memory intentMetadata
     ) external {
         require(msg.sender == address(this), "OnlyInternal");
-        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
+        _executeWithdrawWithIntent(user, tokenId, destination, amount, proof, balancePCT, intentMetadata);
     }
 
     function sendEncryptedMetadata(
@@ -1555,6 +1558,7 @@ contract EncryptedERC is
      *      This provides enhanced privacy as withdrawal amount and details are not publicly visible.
      */
     function _executeWithdrawWithIntent(
+        address user,
         uint256 tokenId,
         address destination,
         uint256 amount,
@@ -1562,7 +1566,7 @@ contract EncryptedERC is
         uint256[7] memory balancePCT,
         bytes memory intentMetadata
     ) internal {
-        address from = msg.sender;
+        address from = user;
         uint256[16] memory publicInputs = proof.publicSignals;
 
         // In the new circuit:
