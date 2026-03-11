@@ -18,7 +18,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {CreateEncryptedERCParams, Point, EGCT, EncryptedBalance, AmountPCT, MintProof, TransferProof, WithdrawProof, BurnProof, TransferInputs} from "./types/Types.sol";
 
 // errors
-import {UserNotRegistered, InvalidProof, TransferFailed, UnknownToken, InvalidChainId, InvalidNullifier, ZeroAddress, PendingIntentExists, BalanceLocked} from "./errors/Errors.sol";
+import {UserNotRegistered, InvalidProof, TransferFailed, UnknownToken, InvalidChainId, InvalidNullifier, ZeroAddress, PendingIntentExists, BalanceLocked, EmptyDenominations, EmptyBatchWindows, NoDenominationsSet, InvalidDenominationIndex, NoBatchWindowsSet, InvalidBatchWindowIndex, BatchWindowNotExpired} from "./errors/Errors.sol";
 
 // interfaces
 import {IRegistrar} from "./interfaces/IRegistrar.sol";
@@ -90,15 +90,20 @@ contract EncryptedERC is
     /// @notice Counter for generating unique intent IDs
     uint256 public nextIntentId;
 
-    /// @notice Time delay before permissionless execution (1 hour for user-only, 24 hours for permissionless)
+    /// @notice Time delay before relayer/permissionless execution (1 hour for user-only)
     uint256 public constant USER_ONLY_DELAY = 1 hours;
-    uint256 public constant PERMISSIONLESS_DELAY = 24 hours;
 
     /// @notice Maximum intent expiry period (30 days)
     uint256 public constant INTENT_EXPIRY = 30 days;
 
     /// @notice Maximum batch size for batch execution
     uint256 public constant MAX_BATCH_SIZE = 50;
+
+    /// @notice tokenId => list of valid denomination amounts in token's own decimals
+    mapping(uint256 => uint256[]) public validDenominations;
+
+    /// @notice Valid batch window durations in seconds shared across all tokens
+    uint256[] public validBatchWindows;
 
     ///////////////////////////////////////////////////
     ///                    Structs                  ///
@@ -115,6 +120,8 @@ contract EncryptedERC is
         address user;
         uint256 tokenId;
         uint256 timestamp;
+        uint256 denominationIndex;
+        uint256 batchWindowSeconds;
         bool executed;
         bool cancelled;
     }
@@ -224,8 +231,13 @@ contract EncryptedERC is
         bytes32 indexed intentHash,
         address indexed user,
         uint256 intentId,
+        uint256 denominationIndex,
+        uint256 batchWindowSeconds,
         uint256 timestamp
     );
+
+    event DenominationsSet(uint256 indexed tokenId, uint256[] amounts);
+    event BatchWindowsSet(uint256[] windowsInSeconds);
 
     /**
      * @notice Emitted when a withdraw intent is executed
@@ -352,6 +364,26 @@ contract EncryptedERC is
     ) external onlyOwner onlyIfUserRegistered(user) {
         uint256[2] memory publicKey_ = registrar.getUserPublicKey(user);
         _updateAuditor(user, publicKey_);
+    }
+
+    function setDenominations(uint256 tokenId, uint256[] calldata amounts) external onlyOwner {
+        if (amounts.length == 0) revert EmptyDenominations();
+        validDenominations[tokenId] = amounts;
+        emit DenominationsSet(tokenId, amounts);
+    }
+
+    function setBatchWindows(uint256[] calldata windows) external onlyOwner {
+        if (windows.length == 0) revert EmptyBatchWindows();
+        validBatchWindows = windows;
+        emit BatchWindowsSet(windows);
+    }
+
+    function getDenominations(uint256 tokenId) external view returns (uint256[] memory) {
+        return validDenominations[tokenId];
+    }
+
+    function getBatchWindows() external view returns (uint256[] memory) {
+        return validBatchWindows;
     }
 
     /**
@@ -675,6 +707,8 @@ contract EncryptedERC is
      */
     function submitWithdrawIntent(
         uint256 tokenId,
+        uint256 denominationIndex,
+        uint256 batchWindowIndex,
         WithdrawProof memory proof,
         uint256[7] memory balancePCT,
         bytes calldata intentMetadata
@@ -690,6 +724,16 @@ contract EncryptedERC is
             revert PendingIntentExists();
         }
 
+        // Validate denomination index
+        uint256[] storage denoms = validDenominations[tokenId];
+        if (denoms.length == 0) revert NoDenominationsSet();
+        if (denominationIndex >= denoms.length) revert InvalidDenominationIndex();
+
+        // Validate batch window index
+        if (validBatchWindows.length == 0) revert NoBatchWindowsSet();
+        if (batchWindowIndex >= validBatchWindows.length) revert InvalidBatchWindowIndex();
+        uint256 batchWindowSeconds = validBatchWindows[batchWindowIndex];
+
         // Extract intentHash from proof public signals [15]
         // This hash was computed in the circuit as: poseidon(amount, destination, tokenId, nonce)
         intentHash = bytes32(proof.publicSignals[15]);
@@ -700,13 +744,15 @@ contract EncryptedERC is
         intent.user = msg.sender;
         intent.tokenId = tokenId;
         intent.timestamp = block.timestamp;
+        intent.denominationIndex = denominationIndex;
+        intent.batchWindowSeconds = batchWindowSeconds;
         intent.executed = false;
         intent.cancelled = false;
 
         // Lock the balance for this token
         pendingIntents[msg.sender][tokenId] = true;
 
-        emit WithdrawIntentSubmitted(intentHash, msg.sender, intentId, block.timestamp);
+        emit WithdrawIntentSubmitted(intentHash, msg.sender, intentId, denominationIndex, batchWindowSeconds, block.timestamp);
 
         return intentHash;
     }
@@ -740,16 +786,16 @@ contract EncryptedERC is
     {
         WithdrawIntent storage intent = withdrawIntents[intentHash];
 
-        require(intent.user != address(0), "IntentNotFound");
-        require(!intent.executed, "IntentAlreadyExecuted");
-        require(!intent.cancelled, "IntentCancelled");
-        require(block.timestamp <= intent.timestamp + INTENT_EXPIRY, "IntentExpired");
+        if (intent.user == address(0)) revert InvalidProof();
+        if (intent.executed) revert InvalidProof();
+        if (intent.cancelled) revert InvalidProof();
+        if (block.timestamp > intent.timestamp + INTENT_EXPIRY) revert InvalidProof();
 
         // Verify the proof's intentHash matches the stored one
-        require(bytes32(proof.publicSignals[15]) == intentHash, "ProofIntentHashMismatch");
+        if (bytes32(proof.publicSignals[15]) != intentHash) revert InvalidProof();
 
         // Verify the provided tokenId matches the stored one
-        require(tokenId == intent.tokenId, "TokenIdMismatch");
+        if (tokenId != intent.tokenId) revert InvalidProof();
 
         // NOTE: We cannot verify amount, destination, nonce here because we'd need to compute
         // poseidon hash on-chain, which is extremely expensive (not supported in Solidity).
@@ -759,9 +805,9 @@ contract EncryptedERC is
         uint256 timeSinceSubmission = block.timestamp - intent.timestamp;
 
         if (timeSinceSubmission < USER_ONLY_DELAY) {
-            require(msg.sender == intent.user, "TooEarlyForRelayer");
-        } else if (timeSinceSubmission < PERMISSIONLESS_DELAY) {
-            require(msg.sender == intent.user, "TooEarlyForPermissionless");
+            if (msg.sender != intent.user) revert InvalidProof();
+        } else {
+            if (timeSinceSubmission < intent.batchWindowSeconds) revert BatchWindowNotExpired();
         }
 
         intent.executed = true;
@@ -807,18 +853,16 @@ contract EncryptedERC is
         external
         onlyIfAuditorSet
     {
-        require(intentHashes.length > 0, "EmptyBatch");
-        require(intentHashes.length <= MAX_BATCH_SIZE, "BatchTooLarge");
-        require(
-            intentHashes.length == tokenIds.length &&
-            intentHashes.length == destinations.length &&
-            intentHashes.length == amounts.length &&
-            intentHashes.length == nonces.length &&
-            intentHashes.length == proofs.length &&
-            intentHashes.length == balancePCTs.length &&
-            intentHashes.length == intentMetadatas.length,
-            "ArrayLengthMismatch"
-        );
+        if (intentHashes.length == 0 || intentHashes.length > MAX_BATCH_SIZE) revert InvalidProof();
+        if (
+            intentHashes.length != tokenIds.length ||
+            intentHashes.length != destinations.length ||
+            intentHashes.length != amounts.length ||
+            intentHashes.length != nonces.length ||
+            intentHashes.length != proofs.length ||
+            intentHashes.length != balancePCTs.length ||
+            intentHashes.length != intentMetadatas.length
+        ) revert InvalidProof();
 
         uint256 successCount = 0;
 
@@ -850,10 +894,8 @@ contract EncryptedERC is
                 if (msg.sender != intent.user) {
                     continue;
                 }
-            } else if (timeSinceSubmission < PERMISSIONLESS_DELAY) {
-                if (msg.sender != intent.user) {
-                    continue;
-                }
+            } else if (timeSinceSubmission < intent.batchWindowSeconds) {
+                continue;
             }
 
             intent.executed = true;
@@ -890,10 +932,8 @@ contract EncryptedERC is
     {
         WithdrawIntent storage intent = withdrawIntents[intentHash];
 
-        require(intent.user != address(0), "IntentNotFound");
-        require(intent.user == msg.sender, "OnlyIntentCreator");
-        require(!intent.executed, "IntentAlreadyExecuted");
-        require(!intent.cancelled, "IntentAlreadyCancelled");
+        if (intent.user == address(0) || intent.user != msg.sender) revert InvalidProof();
+        if (intent.executed || intent.cancelled) revert InvalidProof();
 
         intent.cancelled = true;
 
