@@ -1,5 +1,6 @@
 import "@nomicfoundation/hardhat-chai-matchers";
 import "@nomicfoundation/hardhat-ethers";
+import "@openzeppelin/hardhat-upgrades";
 import "@solarity/chai-zkit";
 import "@solarity/hardhat-zkit";
 import "@typechain/hardhat";

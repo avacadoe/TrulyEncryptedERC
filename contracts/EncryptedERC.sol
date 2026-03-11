@@ -10,6 +10,10 @@ import {EncryptedUserBalances} from "./EncryptedUserBalances.sol";
 import {AuditorManager} from "./auditor/AuditorManager.sol";
 import {EncryptedMetadata} from "./metadata/EncryptedMetadata.sol";
 
+// upgradeable
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+
 // libraries
 import {BabyJubJub} from "./libraries/BabyJubJub.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -56,6 +60,8 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
  * 3. AuditorManager: Manages auditor-related functionality
  */
 contract EncryptedERC is
+    Initializable,
+    UUPSUpgradeable,
     TokenTracker,
     EncryptedUserBalances,
     AuditorManager,
@@ -78,7 +84,8 @@ contract EncryptedERC is
     /// @notice Token metadata
     string public name;
     string public symbol;
-    uint8 public immutable decimals;
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    uint8 public decimals;
 
     /// @notice Mapping to track used mint nullifiers to prevent double-minting
     mapping(uint256 mintNullifier => bool isUsed) public alreadyMinted;
@@ -305,15 +312,21 @@ contract EncryptedERC is
     ///                   Constructor               ///
     ///////////////////////////////////////////////////
 
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
     /**
      * @notice Initializes the EncryptedERC contract with the given parameters
      * @param params The initialization parameters containing contract addresses and token metadata
-     * @dev This constructor sets up the contract with necessary verifiers, registrar, and token metadata.
-     *      It also determines whether the contract will function as a converter or standalone token.
      */
-    constructor(
+    function initialize(
         CreateEncryptedERCParams memory params
-    ) TokenTracker(params.isConverter) {
+    ) external initializer {
+        __UUPSUpgradeable_init();
+        __TokenTracker_init(params.isConverter, msg.sender);
+
         // Validate contract addresses
         if (
             params.registrar == address(0) ||
@@ -343,6 +356,8 @@ contract EncryptedERC is
         decimals = params.decimals;
     }
 
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
     ///////////////////////////////////////////////////
     ///                   External                  ///
     ///////////////////////////////////////////////////
@@ -366,6 +381,15 @@ contract EncryptedERC is
         _updateAuditor(user, publicKey_);
     }
 
+    /**
+     * @notice Directly sets the auditor address and BabyJubJub public key (owner-only)
+     * @param auditorAddress Ethereum address of the auditor
+     * @param publicKey BabyJubJub public key [x, y]
+     */
+    function setAuditorKey(address auditorAddress, uint256[2] calldata publicKey) external onlyOwner {
+        _updateAuditor(auditorAddress, publicKey);
+    }
+
     function setDenominations(uint256 tokenId, uint256[] calldata amounts) external onlyOwner {
         if (amounts.length == 0) revert EmptyDenominations();
         validDenominations[tokenId] = amounts;
@@ -384,121 +408,6 @@ contract EncryptedERC is
 
     function getBatchWindows() external view returns (uint256[] memory) {
         return validBatchWindows;
-    }
-
-    /**
-     * @notice Performs a private mint operation for a registered user
-     * @param user The address of the user to mint tokens to
-     * @param proof The zero-knowledge proof proving the validity of the mint operation
-     * @dev This function:
-     *      1. Validates the chain ID and user registration
-     *      2. Verifies the user's public key matches the proof
-     *      3. Verifies the auditor's public key matches the proof
-     *      4. Checks the mint nullifier hasn't been used
-     *      5. Verifies the zero-knowledge proof
-     *      6. Updates the user's encrypted balance
-     *
-     * Requirements:
-     * - Caller must be the contract owner
-     * - Auditor must be set
-     * - Contract must be in standalone mode
-     * - User must be registered
-     * - Proof must be valid
-     */
-    function privateMint(
-        address user,
-        MintProof calldata proof
-    )
-        external
-        onlyOwner
-        onlyIfAuditorSet
-        onlyForStandalone
-        onlyIfUserRegistered(user)
-    {
-        // executes the private mint operation
-        _executePrivateMint(user, proof, bytes(""));
-    }
-
-    /**
-     * @notice Performs a private mint operation for a registered user with additional metadata
-     * @param user The address of the user to mint tokens to
-     * @param proof The zero-knowledge proof proving the validity of the mint operation
-     * @param message Additional metadata message to be emitted with the mint event
-     * @dev This function:
-     *      1. Validates the chain ID and user registration
-     *      2. Verifies the user's public key matches the proof
-     *      3. Verifies the auditor's public key matches the proof
-     *      4. Checks the mint nullifier hasn't been used
-     *      5. Verifies the zero-knowledge proof
-     *      6. Updates the user's encrypted balance
-     *      7. Emits the mint event with the provided message
-     *
-     * Requirements:
-     * - Caller must be the contract owner
-     * - Auditor must be set
-     * - Contract must be in standalone mode
-     * - User must be registered
-     * - Proof must be valid
-     */
-    function privateMint(
-        address user,
-        MintProof calldata proof,
-        bytes calldata message
-    )
-        external
-        onlyOwner
-        onlyIfAuditorSet
-        onlyForStandalone
-        onlyIfUserRegistered(user)
-    {
-        // executes the private mint operation with message
-        _executePrivateMint(user, proof, message);
-    }
-
-    /**
-     * @notice Performs a private burn operation
-     * @param proof The transfer proof proving the validity of the burn operation
-     * @param balancePCT The balance PCT for the sender after the burn
-     * @dev This function:
-     *      1. Validates the sender is registered
-     *      2. Verifies the sender's public key matches the proof
-     *      3. Verifies the burn address's public key matches the proof
-     *      4. Verifies the auditor's public key matches the proof
-     *      5. Verifies the zero-knowledge proof
-     *      6. Transfers the encrypted amount to the burn address
-     *
-     * Requirements:
-     * - Auditor must be set
-     * - Contract must be in standalone mode
-     * - Sender must be registered
-     * - Proof must be valid
-     */
-    function privateBurn(
-        BurnProof calldata proof,
-        uint256[7] calldata balancePCT
-    )
-        external
-        onlyIfAuditorSet
-        onlyForStandalone
-        onlyIfUserRegistered(msg.sender)
-    {
-        _executePrivateBurn(proof, balancePCT, bytes(""));
-    }
-
-    /**
-     * @notice Performs a private burn operation with additional metadata
-     * @param user The address of the user to burn tokens from
-     * @param proof The zero-knowledge proof proving the validity of the burn operation
-     * @param balancePCT The balance PCT for the user after the burn
-     * @param message Additional metadata message to be emitted with the burn event
-     */
-    function privateBurn(
-        address user,
-        BurnProof calldata proof,
-        uint256[7] calldata balancePCT,
-        bytes calldata message
-    ) external onlyIfAuditorSet onlyForStandalone onlyIfUserRegistered(user) {
-        _executePrivateBurn(proof, balancePCT, message);
     }
 
     /**
@@ -691,7 +600,7 @@ contract EncryptedERC is
         onlyForConverter
         onlyIfUserRegistered(msg.sender)
     {
-        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
+        _executeWithdrawWithIntent(msg.sender, tokenId, destination, amount, proof, balancePCT, intentMetadata);
     }
 
     /**
@@ -816,6 +725,7 @@ contract EncryptedERC is
         pendingIntents[intent.user][intent.tokenId] = false;
 
         _executeWithdrawWithIntent(
+            intent.user,
             tokenId,
             destination,
             amount,
@@ -903,21 +813,17 @@ contract EncryptedERC is
             // Unlock the balance
             pendingIntents[intent.user][intent.tokenId] = false;
 
-            try this._executeWithdrawIntentExternal(
+            _executeWithdrawWithIntent(
+                intent.user,
                 tokenIds[i],
                 destinations[i],
                 amounts[i],
                 proofs[i],
                 balancePCTs[i],
                 intentMetadatas[i]
-            ) {
-                emit WithdrawIntentExecuted(intentHash, msg.sender, block.timestamp);
-                successCount++;
-            } catch {
-                intent.executed = false;
-                // Re-lock on failure
-                pendingIntents[intent.user][intent.tokenId] = true;
-            }
+            );
+            emit WithdrawIntentExecuted(intentHash, msg.sender, block.timestamp);
+            successCount++;
         }
 
         emit BatchWithdrawIntentsExecuted(msg.sender, successCount, block.timestamp);
@@ -943,21 +849,6 @@ contract EncryptedERC is
         emit WithdrawIntentCancelled(intentHash, msg.sender, block.timestamp);
     }
 
-    /**
-     * @notice External wrapper for _executeWithdrawWithIntent used in batch execution
-     */
-    function _executeWithdrawIntentExternal(
-        uint256 tokenId,
-        address destination,
-        uint256 amount,
-        WithdrawProof memory proof,
-        uint256[7] memory balancePCT,
-        bytes memory intentMetadata
-    ) external {
-        require(msg.sender == address(this), "OnlyInternal");
-        _executeWithdrawWithIntent(tokenId, destination, amount, proof, balancePCT, intentMetadata);
-    }
-
     function sendEncryptedMetadata(
         address to,
         bytes calldata message
@@ -965,89 +856,9 @@ contract EncryptedERC is
         _sendEncryptedMetadata(to, message);
     }
 
-    /**
-     * @notice Gets the encrypted balance for a token address
-     * @param user Address of the user
-     * @param tokenAddress Address of the token
-     * @return eGCT The ElGamal ciphertext representing the encrypted balance
-     * @return nonce The current nonce used for balance validation
-     * @return amountPCTs Array of amount PCTs for transaction history
-     * @return balancePCT The current balance PCT
-     * @return transactionIndex The current transaction index
-     * @dev This is a convenience function that looks up the token ID and calls balanceOf
-     */
-    function getBalanceFromTokenAddress(
-        address user,
-        address tokenAddress
-    )
-        public
-        view
-        returns (
-            EGCT memory eGCT,
-            uint256 nonce,
-            AmountPCT[] memory amountPCTs,
-            uint256[7] memory balancePCT,
-            uint256 transactionIndex
-        )
-    {
-        uint256 tokenId = tokenIds[tokenAddress];
-        return balanceOf(user, tokenId);
-    }
-
     ///////////////////////////////////////////////////
     ///                   Internal                  ///
     ///////////////////////////////////////////////////
-
-    /**
-     * @notice Performs the internal logic for a private withdrawal
-     * @param from Address of the user withdrawing tokens
-     * @param amount Amount of tokens to withdraw
-     * @param tokenId ID of the token to withdraw
-     * @param publicInputs Public inputs from the proof
-     * @param balancePCT The balance PCT for the user after the withdrawal
-     * @dev This function:
-     *      1. Validates the token exists
-     *      2. Verifies the provided balance is valid
-     *      3. Subtracts the encrypted amount from the user's balance
-     *      4. Converts the tokens to regular ERC20 tokens
-     */
-    function _withdraw(
-        address from,
-        uint256 amount,
-        uint256 tokenId,
-        uint256[16] memory publicInputs,
-        uint256[7] memory balancePCT
-    ) internal {
-        address tokenAddress = tokenAddresses[tokenId];
-        if (tokenAddress == address(0)) {
-            revert UnknownToken();
-        }
-
-        {
-            // Extract the provided balance from the proof
-            EGCT memory providedBalance = EGCT({
-                c1: Point({x: publicInputs[3], y: publicInputs[4]}),
-                c2: Point({x: publicInputs[5], y: publicInputs[6]})
-            });
-
-            // Encrypt the withdrawn amount
-            EGCT memory encryptedWithdrawnAmount = BabyJubJub.encrypt(
-                Point({x: publicInputs[1], y: publicInputs[2]}),
-                amount
-            );
-
-            _privateBurn(
-                from,
-                tokenId,
-                providedBalance,
-                encryptedWithdrawnAmount,
-                balancePCT
-            );
-        }
-
-        // Convert and transfer the tokens
-        _convertTo(from, amount, tokenAddress);
-    }
 
     /**
      * @notice Internal function for withdrawal to a specific destination address
@@ -1362,137 +1173,6 @@ contract EncryptedERC is
     }
 
     /**
-     * @notice Performs the internal logic for a private mint
-     * @param user Address of the user to mint tokens to
-     * @param proof The zero-knowledge proof proving the validity of the mint operation
-     * @param message Additional metadata message to be emitted with the mint event
-     */
-    function _executePrivateMint(
-        address user,
-        MintProof calldata proof,
-        bytes memory message
-    ) internal {
-        uint256[24] memory publicInputs = proof.publicSignals;
-
-        // Validate chain ID
-        if (block.chainid != publicInputs[0]) {
-            revert InvalidChainId();
-        }
-
-        // validate public keys
-        _validatePublicKey(user, [publicInputs[2], publicInputs[3]]);
-        _validateAuditorPublicKey([publicInputs[15], publicInputs[16]]);
-
-        // Validate and check mint nullifier
-        uint256 mintNullifier = publicInputs[1];
-        if (mintNullifier >= BabyJubJub.Q) {
-            revert InvalidNullifier();
-        }
-        if (alreadyMinted[mintNullifier]) {
-            revert InvalidProof();
-        }
-
-        // Verify the zero-knowledge proof
-        bool isVerified = mintVerifier.verifyProof(
-            proof.proofPoints.a,
-            proof.proofPoints.b,
-            proof.proofPoints.c,
-            proof.publicSignals
-        );
-        if (!isVerified) {
-            revert InvalidProof();
-        }
-
-        {
-            // Extract the encrypted amount from the proof
-            EGCT memory encryptedAmount = EGCT({
-                c1: Point({x: publicInputs[4], y: publicInputs[5]}),
-                c2: Point({x: publicInputs[6], y: publicInputs[7]})
-            });
-
-            // Extract amount PCT
-            uint256[7] memory amountPCT;
-            for (uint256 i = 0; i < 7; i++) {
-                amountPCT[i] = publicInputs[8 + i];
-            }
-
-            // since private mint is only for the standalone ERC, tokenId is always 0
-            _addToUserBalance(user, 0, encryptedAmount, amountPCT);
-        }
-
-        // mark the mint nullifier as used
-        alreadyMinted[mintNullifier] = true;
-
-        uint256[7] memory auditorPCT;
-        for (uint256 i = 0; i < auditorPCT.length; i++) {
-            auditorPCT[i] = publicInputs[17 + i];
-        }
-
-        emit PrivateMint(user, auditorPCT, auditor);
-
-        // emit metadata if message is provided
-        _emitMetadata(msg.sender, user, "PRIVATE_MINT", message);
-    }
-
-    /**
-     * @notice Executes a private burn operation
-     * @param proof The zero-knowledge proof proving the validity of the burn operation
-     * @param balancePCT The balance PCT for the user after the burn
-     * @param message Additional metadata message to be emitted with the burn event
-     */
-    function _executePrivateBurn(
-        BurnProof calldata proof,
-        uint256[7] calldata balancePCT,
-        bytes memory message
-    ) internal {
-        uint256[19] calldata publicInputs = proof.publicSignals;
-        address from = msg.sender;
-
-        // validate public key
-        _validatePublicKey(from, [publicInputs[0], publicInputs[1]]);
-
-        // validate auditor public key
-        _validateAuditorPublicKey([publicInputs[10], publicInputs[11]]);
-
-        // Verify the zero-knowledge proof
-        bool isVerified = burnVerifier.verifyProof(
-            proof.proofPoints.a,
-            proof.proofPoints.b,
-            proof.proofPoints.c,
-            proof.publicSignals
-        );
-        if (!isVerified) {
-            revert InvalidProof();
-        }
-
-        // provided encrypted balance
-        EGCT memory providedBalance = EGCT({
-            c1: Point({x: publicInputs[2], y: publicInputs[3]}),
-            c2: Point({x: publicInputs[4], y: publicInputs[5]})
-        });
-
-        // extract encrypted burn amount
-        EGCT memory encryptedBurnAmount = EGCT({
-            c1: Point({x: publicInputs[6], y: publicInputs[7]}),
-            c2: Point({x: publicInputs[8], y: publicInputs[9]})
-        });
-
-        // perform the burn (since burn is only for Standalone, always passing tokenId as 0)
-        _privateBurn(from, 0, providedBalance, encryptedBurnAmount, balancePCT);
-
-        // extract auditor PCT
-        uint256[7] memory auditorPCT;
-        for (uint256 i = 0; i < auditorPCT.length; i++) {
-            auditorPCT[i] = publicInputs[12 + i];
-        }
-
-        emit PrivateBurn(from, auditorPCT, auditor);
-
-        // emit metadata if message is provided
-        _emitMetadata(msg.sender, from, "PRIVATE_BURN", message);
-    }
-
-    /**
      * @notice Executes a private deposit operation
      * @param amount The amount of tokens to deposit
      * @param tokenAddress The address of the token to deposit
@@ -1566,7 +1246,7 @@ contract EncryptedERC is
         }
 
         // Perform the withdrawal
-        _withdraw(from, amount, tokenId, publicInputs, balancePCT);
+        _withdrawTo(from, from, amount, tokenId, publicInputs, balancePCT);
 
         // Extract auditor PCT and emit event
         {
@@ -1595,6 +1275,7 @@ contract EncryptedERC is
      *      This provides enhanced privacy as withdrawal amount and details are not publicly visible.
      */
     function _executeWithdrawWithIntent(
+        address from,
         uint256 tokenId,
         address destination,
         uint256 amount,
@@ -1602,7 +1283,6 @@ contract EncryptedERC is
         uint256[7] memory balancePCT,
         bytes memory intentMetadata
     ) internal {
-        address from = msg.sender;
         uint256[16] memory publicInputs = proof.publicSignals;
 
         // In the new circuit:

@@ -5,7 +5,7 @@
 pragma solidity 0.8.27;
 
 import {Point} from "../types/Types.sol";
-import {ZeroAddress} from "../errors/Errors.sol";
+import {ZeroAddress, AuditorKeyNotSet} from "../errors/Errors.sol";
 
 /**
  * @title AuditorManager
@@ -26,12 +26,12 @@ abstract contract AuditorManager {
 
     /// @notice The address of the current auditor
     /// @dev This address is used to identify the auditor and for access control
-    address public auditor = address(0);
+    address public auditor;
 
     /// @notice The public key of the current auditor
     /// @dev This is used in zero-knowledge proofs to validate auditor signatures
     ///      The point (0,1) is considered invalid as it's the identity point in the elliptic curve
-    Point public auditorPublicKey = Point({x: 0, y: 0});
+    Point public auditorPublicKey;
 
     ///////////////////////////////////////////////////
     ///                    Events                   ///
@@ -62,11 +62,8 @@ abstract contract AuditorManager {
      * - Auditor address must be set (not zero address)
      */
     modifier onlyIfAuditorSet() {
-        require(
-            auditorPublicKey.x != 0 && auditorPublicKey.y != 1,
-            "Auditor public key not set"
-        );
-        require(auditor != address(0), "Auditor not set");
+        if (auditorPublicKey.x == 0 || auditorPublicKey.y == 1) revert AuditorKeyNotSet();
+        if (auditor == address(0)) revert ZeroAddress();
         _;
     }
 

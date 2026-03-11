@@ -5,7 +5,7 @@
 
 pragma solidity 0.8.27;
 
-import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {TokenBlacklisted, InvalidOperation} from "../errors/Errors.sol";
 
 /**
@@ -20,14 +20,14 @@ import {TokenBlacklisted, InvalidOperation} from "../errors/Errors.sol";
  * - Converter Mode: Wraps existing ERC20 tokens into encrypted tokens
  * - Standalone Mode: Operates as a standalone encrypted token
  */
-contract TokenTracker is Ownable2Step {
+contract TokenTracker is Ownable2StepUpgradeable {
     ///////////////////////////////////////////////////
     ///                   State Variables           ///
     ///////////////////////////////////////////////////
 
     /// @notice The next available token ID
     /// @dev Token IDs start from 1, with 0 reserved for the standalone version
-    uint256 public nextTokenId = 1;
+    uint256 public nextTokenId;
 
     /// @notice Indicates if the contract is operating in converter mode
     bool public isConverter;
@@ -84,15 +84,18 @@ contract TokenTracker is Ownable2Step {
     }
 
     ///////////////////////////////////////////////////
-    ///                   Constructor               ///
+    ///                   Initializer              ///
     ///////////////////////////////////////////////////
 
     /**
      * @notice Initializes the TokenTracker contract
      * @param isConverter_ Determines if the contract operates in converter mode
-     * @dev Sets the initial mode of operation and initializes the owner
+     * @param initialOwner Address to set as the initial owner
      */
-    constructor(bool isConverter_) Ownable(msg.sender) {
+    function __TokenTracker_init(bool isConverter_, address initialOwner) internal onlyInitializing {
+        __Ownable_init(initialOwner);
+        __Ownable2Step_init();
+        nextTokenId = 1;
         isConverter = isConverter_;
     }
 
