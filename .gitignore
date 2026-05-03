@@ -24,3 +24,8 @@ gas-report.txt
 # zkit
 generated-types/
 zkit/
+
+# Fuji testnet keys and intent data (sensitive — never commit)
+scripts/fuji-key*.json
+scripts/fuji-intent*.json
+scripts/fuji-intents-all.json

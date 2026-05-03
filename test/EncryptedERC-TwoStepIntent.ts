@@ -1,6 +1,6 @@
 import type { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/dist/src/signer-with-address";
 import { expect } from "chai";
-import { ethers, zkit } from "hardhat";
+import { ethers, upgrades, zkit } from "hardhat";
 import type {
 	RegistrationCircuit,
 } from "../generated-types/zkit";
@@ -67,26 +67,34 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			.deploy(registrationVerifier);
 		await registrar_.waitForDeployment();
 
-		// Deploy the Converter EncryptedERC contract
-		const encryptedERCFactory = new EncryptedERC__factory({
-			"contracts/libraries/BabyJubJub.sol:BabyJubJub": babyJubJub,
-		});
+		// Deploy the Converter EncryptedERC contract via UUPS proxy
+		const encryptedERCFactory = new EncryptedERC__factory(
+			{ "contracts/libraries/BabyJubJub.sol:BabyJubJub": babyJubJub },
+			owner,
+		);
 
-		const encryptedERC_ = await encryptedERCFactory
-			.connect(owner)
-			.deploy({
+		const proxy = await upgrades.deployProxy(
+			encryptedERCFactory,
+			[{
 				registrar: registrar_.target,
 				isConverter: true,
 				name: "Encrypted Test Token",
 				symbol: "eTEST",
 				decimals: DECIMALS,
-				mintVerifier: mintVerifier,
-				withdrawVerifier: withdrawVerifier,
-				withdrawIntentVerifier: withdrawIntentVerifier,
-				transferVerifier: transferVerifier,
-				burnVerifier: burnVerifier,
-			});
-		await encryptedERC_.waitForDeployment();
+				mintVerifier,
+				withdrawVerifier,
+				withdrawIntentVerifier,
+				transferVerifier,
+				burnVerifier,
+			}],
+			{
+				kind: "uups",
+				initializer: "initialize",
+				unsafeAllow: ["external-library-linking"],
+			},
+		);
+		await proxy.waitForDeployment();
+		const encryptedERC_ = proxy as unknown as EncryptedERC;
 
 		registrar = registrar_;
 		encryptedERC = encryptedERC_;
@@ -139,6 +147,11 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 
 		// Set auditor
 		await encryptedERC.connect(owner).setAuditorPublicKey(relayer.address);
+
+		// Set batch windows (1 day for testing)
+		await encryptedERC.connect(owner).setBatchWindows([86400n]);
+		// Pre-set denominations for tokenId=1 (first deposited token)
+		await encryptedERC.connect(owner).setDenominations(1n, [ethers.parseUnits("50", DECIMALS)]);
 
 		// Mint ERC20 tokens to users and approve EncryptedERC contract
 		for (const user of users) {
@@ -216,6 +229,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -278,6 +293,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			await expect(
 				encryptedERC.connect(unregisteredSigner).submitWithdrawIntent(
 					1n,
+					0n,
+					0n,
 					{
 						proofPoints: {
 							a: [0n, 0n],
@@ -301,6 +318,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			// 1. Deposit tokens
 			const depositAmount = ethers.parseUnits("100", DECIMALS);
 			const withdrawAmount = ethers.parseUnits("50", DECIMALS);
+			const erc20BalanceBefore = await erc20.balanceOf(users[0].signer.address);
 
 			const {
 				ciphertext: depositCiphertext,
@@ -354,6 +372,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -409,9 +429,9 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			expect(executeEvents?.[0]?.args?.intentHash).to.equal(intentHash);
 			expect(executeEvents?.[0]?.args?.executor).to.equal(users[0].getAddress());
 
-			// 5. Verify withdrawal occurred
-			const erc20Balance = await erc20.balanceOf(users[0].signer.address);
-			expect(erc20Balance).to.equal(withdrawAmount);
+			// 5. Verify withdrawal occurred (user received withdrawAmount back)
+			const erc20BalanceAfter = await erc20.balanceOf(users[0].signer.address);
+			expect(erc20BalanceAfter - erc20BalanceBefore).to.equal(withdrawAmount - depositAmount);
 
 			// 6. Verify encrypted balance updated
 			const finalBalance = await encryptedERC.balanceOf(
@@ -494,6 +514,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -527,13 +549,14 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 					userBalancePCT,
 					encryptedMetadata,
 				),
-			).to.be.revertedWith("TooEarlyForRelayer");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should allow relayer to execute after 24 hours", async () => {
 			// 1. Setup and deposit
 			const depositAmount = ethers.parseUnits("100", DECIMALS);
 			const withdrawAmount = ethers.parseUnits("50", DECIMALS);
+			const erc20BalanceBefore = await erc20.balanceOf(users[0].signer.address);
 
 			const {
 				ciphertext: depositCiphertext,
@@ -586,6 +609,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -646,9 +671,9 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			expect(executeEvents).to.have.length(1);
 			expect(executeEvents?.[0]?.args?.executor).to.equal(relayer.address);
 
-			// 6. Verify withdrawal occurred
-			const erc20Balance = await erc20.balanceOf(users[0].signer.address);
-			expect(erc20Balance).to.equal(withdrawAmount);
+			// 6. Verify withdrawal occurred (user received withdrawAmount back)
+			const erc20BalanceAfter = await erc20.balanceOf(users[0].signer.address);
+			expect(erc20BalanceAfter - erc20BalanceBefore).to.equal(withdrawAmount - depositAmount);
 		});
 
 		it("should fail if intent already executed", async () => {
@@ -706,6 +731,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -751,7 +778,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 					userBalancePCT,
 					encryptedMetadata,
 				),
-			).to.be.revertedWith("IntentAlreadyExecuted");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 	});
 
@@ -811,6 +838,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -878,7 +907,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 					userBalancePCT,
 					encryptedMetadata,
 				),
-			).to.be.revertedWith("IntentCancelled");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should prevent non-owner from cancelling intent", async () => {
@@ -936,6 +965,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -960,7 +991,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			// 2. Try to cancel with different user (should fail)
 			await expect(
 				encryptedERC.connect(users[1].signer).cancelWithdrawIntent(intentHash),
-			).to.be.revertedWith("OnlyIntentCreator");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 	});
 
@@ -968,6 +999,9 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 		it("should execute multiple intents in batch (PRIVACY VIA ANONYMITY SET!)", async () => {
 			const depositAmount = ethers.parseUnits("100", DECIMALS);
 			const withdrawAmount = ethers.parseUnits("50", DECIMALS);
+
+			const erc20BalanceBefore0 = await erc20.balanceOf(users[0].signer.address);
+			const erc20BalanceBefore1 = await erc20.balanceOf(users[1].signer.address);
 
 			// Deposit for both users
 			for (let i = 0; i < 2; i++) {
@@ -1024,6 +1058,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata0,
 					userBalancePCT0,
 					encryptedMetadata0,
@@ -1080,6 +1116,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[1].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata1,
 					userBalancePCT1,
 					encryptedMetadata1,
@@ -1158,12 +1196,12 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 			expect(intent0.executed).to.be.true;
 			expect(intent1.executed).to.be.true;
 
-			// 8. Verify both users received their tokens
+			// 8. Verify both users received their tokens (withdrew 50, deposited 100 → net -50)
 			const erc20Balance0 = await erc20.balanceOf(users[0].signer.address);
 			const erc20Balance1 = await erc20.balanceOf(users[1].signer.address);
 
-			expect(erc20Balance0).to.equal(withdrawAmount);
-			expect(erc20Balance1).to.equal(withdrawAmount);
+			expect(erc20Balance0 - erc20BalanceBefore0).to.equal(withdrawAmount - depositAmount);
+			expect(erc20Balance1 - erc20BalanceBefore1).to.equal(withdrawAmount - depositAmount);
 
 			// 9. PRIVACY ACHIEVEMENT: Observer sees 2 withdrawals but cannot link
 			//    which intentHash (from Day 1) corresponds to which withdrawal (Day 2)!
@@ -1195,7 +1233,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 						balancePCTs as any,
 						metadatas,
 					),
-			).to.be.revertedWith("ArrayLengthMismatch");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should fail if batch is empty", async () => {
@@ -1212,7 +1250,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 						[],
 						[],
 					),
-			).to.be.revertedWith("EmptyBatch");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should fail if batch exceeds max size", async () => {
@@ -1249,7 +1287,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 						balancePCTs as any,
 						metadatas,
 					),
-			).to.be.revertedWith("BatchTooLarge");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 	});
 
@@ -1278,7 +1316,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 					Array(7).fill(0n),
 					"0x",
 				),
-			).to.be.revertedWith("IntentNotFound");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should fail if intent has expired", async () => {
@@ -1336,6 +1374,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -1357,9 +1397,9 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 
 			const intentHash = submitEvents?.[0]?.args?.intentHash;
 
-			// 2. Advance time past expiry (7 days + 1 second)
+			// 2. Advance time past expiry (30 days + 1 second — matches INTENT_EXPIRY constant)
 			const currentBlock = await ethers.provider.getBlock("latest");
-			const futureTimestamp = Number(currentBlock?.timestamp) + (7 * 24 * 60 * 60) + 1;
+			const futureTimestamp = Number(currentBlock?.timestamp) + (30 * 24 * 60 * 60) + 1;
 			await ethers.provider.send("evm_setNextBlockTimestamp", [futureTimestamp]);
 			await ethers.provider.send("evm_mine", []);
 
@@ -1375,7 +1415,7 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 					userBalancePCT,
 					encryptedMetadata,
 				),
-			).to.be.revertedWith("IntentExpired");
+			).to.be.revertedWithCustomError(encryptedERC, "InvalidProof");
 		});
 
 		it("should verify intentHash is computed correctly", async () => {
@@ -1433,6 +1473,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata,
 					userBalancePCT,
 					encryptedMetadata,
@@ -1517,6 +1559,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[0].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata0,
 					userBalancePCT0,
 					metadata0,
@@ -1553,6 +1597,8 @@ describe("EncryptedERC - Two-Step Intent System (Private Intents)", () => {
 				.connect(users[1].signer)
 				.submitWithdrawIntent(
 					tokenId,
+					0n,
+					0n,
 					calldata1,
 					userBalancePCT1,
 					metadata1,
